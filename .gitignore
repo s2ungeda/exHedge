@@ -4,6 +4,7 @@
 tokens/
 *.token
 *.pem
+!deploy/files/.env 
 
 # 사용자별 화면 설정 (비밀 아님, 개인 설정이라 제외)
 config/
@@ -22,6 +23,8 @@ venv/
 .ruff_cache/
 build/
 dist/
+deploy/dist_stage/
+deploy/*.spec
 
 # Logs
 *.log
