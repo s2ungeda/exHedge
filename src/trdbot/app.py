@@ -684,6 +684,9 @@ class TradingApp:
         # 리스크로 주문이 막힌 상태를 알람으로 — 최대잔고한도 초과 보류(주문이 나가야 하는데 안 나감).
         if "최대잔고한도" in msg:
             self._raise_alarm("maxpos", "최대잔고한도 초과 — 주문 보류")
+        # 증거금부족 거부는 재시도로 안 풀린다(입금·한도 조정 필요) → 사람이 알아야 함.
+        if "주문거부" in msg and "증거금" in msg:
+            self._raise_alarm("margin", "증거금 부족 — 주문 거부 중(예탁금·최대잔고한도 확인)")
 
     def run(self) -> None:
         try:

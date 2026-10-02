@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 from typing import Callable, Literal
 
+from lsapi.exceptions import LSOrderError
 from lsapi.futures import FuturesAPI, NightFuturesAPI, session_now
 from lsapi.util import redact
 from trdbot.datastore import MarketDataStore
@@ -29,16 +30,27 @@ Side = Literal["buy", "sell"]
 USD_FUTURES_TICK = 0.10
 
 
-def _log_order_resp(tr: str, resp: dict, side: str, qty: int, price: float, code: str) -> None:
-    """주문 응답 한 줄 — 주문번호·응답코드·OutBlock2 원문(비번 마스킹).
+def _order_no(tr: str, resp: dict, side: str, qty: int, price: float, code: str) -> str:
+    """주문 응답 → 주문번호. 응답 원문을 남기고, 주문번호가 없거나 0이면 거부로 본다.
 
-    거부가 OutBlock을 동봉해 오면(야간 02752 증거금부족 실측) 예외 없이 지나가므로,
-    응답 원문을 남겨야 주문번호가 실제로 무엇이었는지 사후에 확인할 수 있다.
+    거부가 OutBlock을 동봉해 오면(야간 CCENT00100 02752 증거금부족 실측) client가 예외를
+    내지 않는다. 그 응답의 무의미한 주문번호를 성공으로 받으면 존재하지 않는 주문을 미체결로
+    들고 있다가 취소(02259 주문내용 없음)→재주문을 반복한다 → 여기서 LSOrderError로 끊어
+    executor의 거부 처리(백오프·화면 표시)를 타게 한다.
     """
     out2 = resp.get(f"{tr}OutBlock2", {})
+    ordno = out2.get("OrdNo")
     logger.info("주문응답 #%s %s %d@%s %s [%s %s] OutBlock2=%s",
-                out2.get("OrdNo"), side, qty, price, code,
+                ordno, side, qty, price, code,
                 resp.get("rsp_cd"), resp.get("rsp_msg"), redact(out2))
+    try:
+        valid = int(str(ordno).strip()) > 0
+    except (TypeError, ValueError):
+        valid = False
+    if not valid:
+        raise LSOrderError(f"[{resp.get('rsp_cd')}] {resp.get('rsp_msg') or '주문번호 없음'}",
+                           code=resp.get("rsp_cd"), payload=redact(resp))
+    return str(ordno).strip()
 
 
 def _cancel(store: MarketDataStore, api, code: str, order_no: str) -> None:
@@ -102,10 +114,7 @@ class LSDayFuturesBroker:
 
     def place_order(self, side: Side, qty: int, price: float) -> str:
         resp = self.api.place_order(self.code, qty, side=side, kind="limit", price=price)
-        _log_order_resp("CFOAT00100", resp, side, qty, price, self.code)
-        ordno = resp.get("CFOAT00100OutBlock2", {}).get("OrdNo")
-        if ordno is None:
-            raise RuntimeError(f"주문번호 없음: {resp.get('rsp_msg')}")
+        ordno = _order_no("CFOAT00100", resp, side, qty, price, self.code)
         # in-flight 등록(이중주문 방지) — expcode로 모니터 미체결 표시까지 채움
         self._store.note_placed(str(ordno), side, qty, price, expcode=self.code)
         self._store.invalidate_open_orders()                   # 새 주문 → 미체결 변동
@@ -175,10 +184,7 @@ class LSNightFuturesBroker:
 
     def place_order(self, side: Side, qty: int, price: float) -> str:
         resp = self.api.place_order(self.code, qty, side=side, kind="limit", price=price)
-        _log_order_resp("CCENT00100", resp, side, qty, price, self.code)
-        ordno = resp.get("CCENT00100OutBlock2", {}).get("OrdNo")
-        if ordno is None:
-            raise RuntimeError(f"야간 주문번호 없음: {resp.get('rsp_msg')}")
+        ordno = _order_no("CCENT00100", resp, side, qty, price, self.code)
         self._store.note_placed(str(ordno), side, qty, price, expcode=self.code)  # in-flight 등록
         self._store.invalidate_open_orders()
         return str(ordno)

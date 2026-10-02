@@ -61,3 +61,28 @@ def test_취소대상_없으면_생략도_기록(caplog):
         b.cancel("999")
     assert any("취소 생략 #999" in r.getMessage() for r in caplog.records)
     assert api.cancelled == []
+
+
+def test_거부응답_주문번호0이면_예외_미체결로_안남김():
+    """야간 02752(증거금부족)는 OutBlock을 동봉해 예외 없이 온다 → 주문번호 0이면 거부 처리."""
+    import pytest
+
+    from lsapi.exceptions import LSOrderError
+
+    resp = {"rsp_cd": "02752", "rsp_msg": "증거금부족으로 주문이 불가합니다.",
+            "CFOAT00100OutBlock2": {"OrdNo": 0}}
+    b, _ = _broker(resp)
+    with pytest.raises(LSOrderError, match="02752"):
+        b.place_order("buy", 2, 1363.0)
+    assert b.get_open_orders() == []   # 존재하지 않는 주문을 미체결로 들고 있지 않음
+
+
+def test_주문번호_없거나_빈값도_거부():
+    import pytest
+
+    from lsapi.exceptions import LSOrderError
+
+    for out2 in ({}, {"OrdNo": ""}, {"OrdNo": "  "}):
+        b, _ = _broker({"rsp_cd": "99999", "CFOAT00100OutBlock2": out2})
+        with pytest.raises(LSOrderError):
+            b.place_order("buy", 1, 1363.0)
