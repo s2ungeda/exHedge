@@ -335,13 +335,8 @@ class TradingApp:
 
     # ---- 실행/정지 (화면 토글 콜백) ----
     def _start(self, cfg: OrderConfig) -> None:
-        # 보유 원달러(계약수)는 OrderConfig에 없으니 화면 입력에서 직접 읽는다.
-        try:
-            held_raw = self.screen._inputs["usd_futures_held"].get().replace(",", "").strip()
-            held = int(held_raw) if held_raw not in ("", "-") else 0
-        except ValueError:
-            held = 0
-        self._ratios = (cfg.hedge_ratio, held)
+        # 보유 원달러는 build_config가 검증한 값(잘못된 입력이면 실행 자체가 막힘).
+        self._ratios = (cfg.hedge_ratio, cfg.usd_futures_held)
         self._fill_window_sec = cfg.fill_window_min * 60.0
         self._fill_limit = cfg.fill_limit
         self._trade_enabled = False   # 매 실행은 관찰모드로 시작(안전) — '주문' 체크해야 실주문

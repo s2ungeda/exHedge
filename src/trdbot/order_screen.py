@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import tkinter as tk
 from dataclasses import dataclass, field
 from datetime import time
@@ -58,6 +59,7 @@ class OrderConfig:
     night_window: TimeWindow    # 야간 주문가능시간
     fill_window_min: float = 10.0  # 체결량 감시 시간(분)
     fill_limit: int = 0            # 이 시간 내 누적 체결량 한도(개). 0=기능 끔
+    usd_futures_held: int = 0      # 보유 원달러(계약수 ±) → C(달러노출선물계약수) 그대로
     extra: dict = field(default_factory=dict)
 
 
@@ -95,6 +97,20 @@ def _num(label: str, s: str, *, cast, minv=None, allow_zero=True):
     return v
 
 
+def _is_signed_int_input(text: str) -> bool:
+    """입력 중인 칸 값 검사 — 빈칸, '-'(입력 중), 부호 있는 정수만 허용."""
+    return re.fullmatch(r"-?\d*", text) is not None
+
+
+def _held(raw: dict[str, str]) -> int:
+    """보유 원달러(±정수 계약수). 빈값은 0, 숫자가 아니거나 소수면 ValueError.
+
+    C에 그대로 들어가는 값이라 잘못된 입력을 0으로 삼키면 안 된다(실행 전에 막는다).
+    """
+    s = raw.get("usd_futures_held", "").strip()
+    return 0 if s == "" else _num("보유 원달러(계약수)", s, cast=int)
+
+
 def build_config(raw: dict[str, str]) -> OrderConfig:
     """화면 입력(str dict) → 검증된 OrderConfig. 오류 시 ValueError.
 
@@ -110,6 +126,7 @@ def build_config(raw: dict[str, str]) -> OrderConfig:
     interval = _num("주문 인터벌(s)", raw.get("order_interval_sec", ""), cast=float, minv=0, allow_zero=False)
     maxpos = _num("최대잔고한도", raw.get("max_position", ""), cast=int, minv=1)
     b = _num("헤지비율(B)", raw.get("hedge_ratio", ""), cast=float, minv=0)
+    held = _held(raw)
     fwin, flim = _fill_params(raw)
 
     day = TimeWindow(parse_time(raw.get("day_start", "")), parse_time(raw.get("day_end", "")))
@@ -122,7 +139,7 @@ def build_config(raw: dict[str, str]) -> OrderConfig:
         code=code, qty_per_order=qty, order_interval_sec=interval, max_position=maxpos,
         hedge_ratio=b,
         day_window=day, night_window=night,
-        fill_window_min=fwin, fill_limit=flim,
+        fill_window_min=fwin, fill_limit=flim, usd_futures_held=held,
     )
 
 
@@ -151,8 +168,7 @@ def parse_live_params(raw: dict[str, str]) -> dict:
     + 체결감시시간(분)·체결량한도(개).
     """
     b = _num("헤지비율(B)", raw.get("hedge_ratio", ""), cast=float, minv=0)
-    held_raw = raw.get("usd_futures_held", "").strip()
-    held = _num("보유 원달러", held_raw, cast=int) if held_raw not in ("", "-") else 0
+    held = _held(raw)
     qty = _num("1회주문계약수", raw.get("qty_per_order", ""), cast=int, minv=2)
     interval = _num("주문 인터벌(s)", raw.get("order_interval_sec", ""), cast=float,
                     minv=0, allow_zero=False)
@@ -440,6 +456,9 @@ class OrderScreen:
         wrap = tk.Frame(c, bg=C["card"])
         wrap.grid(row=1, column=1, sticky="w", pady=1)
         held = self._entry(wrap, "usd_futures_held", "0", width=8)
+        # 숫자와 맨 앞 '-'만 입력되게(키 입력·붙여넣기 모두). 실행/적용 때 build_config도 재검증.
+        held.configure(validate="key",
+                       validatecommand=(held.register(_is_signed_int_input), "%P"))
         held.pack(side="left")
         self._lab(c, "헤지비율").grid(row=1, column=2, sticky="e", pady=1, padx=(14, 6))
         self._pct(c, "hedge_ratio", 1, 3)
