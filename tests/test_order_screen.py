@@ -23,8 +23,9 @@ def test_정상_파싱():
     assert "account_dollar_ratio" not in p   # A는 실행 중 변경 대상에서 제외
 
 
-def test_보유원달러_빈값은_0():
-    assert parse_live_params(_raw(usd_futures_held=""))["usd_futures_held"] == 0
+def test_적용시_보유원달러_빈칸이면_오류():
+    with pytest.raises(ValueError, match="보유 원달러"):
+        parse_live_params(_raw(usd_futures_held=""))
 
 
 def test_보유원달러_정수_음수허용():
@@ -84,7 +85,7 @@ def _cfg_raw(**kw):
     return base
 
 
-@pytest.mark.parametrize("bad", ["asdfasdf", "2.5", "1,2a", "-"])
+@pytest.mark.parametrize("bad", ["", "  ", "asdfasdf", "2.5", "1,2a", "-"])
 def test_실행시_보유원달러_잘못된값이면_오류(bad):
     with pytest.raises(ValueError, match="보유 원달러"):
         build_config(_cfg_raw(usd_futures_held=bad))
@@ -92,7 +93,7 @@ def test_실행시_보유원달러_잘못된값이면_오류(bad):
 
 def test_실행시_보유원달러_정상값은_config로():
     assert build_config(_cfg_raw(usd_futures_held="-7")).usd_futures_held == -7
-    assert build_config(_cfg_raw(usd_futures_held="")).usd_futures_held == 0
+    assert build_config(_cfg_raw(usd_futures_held="0")).usd_futures_held == 0
 
 
 def test_적용시_보유원달러_잘못된값이면_오류():

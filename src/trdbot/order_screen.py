@@ -103,12 +103,12 @@ def _is_signed_int_input(text: str) -> bool:
 
 
 def _held(raw: dict[str, str]) -> int:
-    """보유 원달러(±정수 계약수). 빈값은 0, 숫자가 아니거나 소수면 ValueError.
+    """보유 원달러(±정수 계약수). 빈칸·숫자 아님·소수면 ValueError.
 
-    C에 그대로 들어가는 값이라 잘못된 입력을 0으로 삼키면 안 된다(실행 전에 막는다).
+    C에 그대로 들어가는 값이라 잘못된 입력이나 실수로 지운 칸을 0으로 삼키면 안 된다
+    (실행·적용 전에 막는다). 0이면 0을 직접 입력. 칸 기본값은 0.
     """
-    s = raw.get("usd_futures_held", "").strip()
-    return 0 if s == "" else _num("보유 원달러(계약수)", s, cast=int)
+    return _num("보유 원달러(계약수)", raw.get("usd_futures_held", ""), cast=int)
 
 
 def build_config(raw: dict[str, str]) -> OrderConfig:
@@ -456,6 +456,8 @@ class OrderScreen:
         wrap = tk.Frame(c, bg=C["card"])
         wrap.grid(row=1, column=1, sticky="w", pady=1)
         held = self._entry(wrap, "usd_futures_held", "0", width=8)
+        if not held.get().strip():
+            held.insert(0, "0")   # 기본값 0 — 저장값이 빈칸이어도(비운 채 닫음) 0으로 시작
         # 숫자와 맨 앞 '-'만 입력되게(키 입력·붙여넣기 모두). 실행/적용 때 build_config도 재검증.
         held.configure(validate="key",
                        validatecommand=(held.register(_is_signed_int_input), "%P"))
