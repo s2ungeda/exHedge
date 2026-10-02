@@ -6,6 +6,8 @@
 #   setup.exe   API 키·계좌비번 등록(콘솔)
 #   .env        계좌번호 등 설정 템플릿
 #   사용법.txt
+# 압축: deploy\TrdBot_YYYYMMDD_HHmm.zip — 위 폴더에서 .env 를 빼고 .env.template 를 넣은 것
+#   (운영 폴더에 풀어 덮어써도 계좌번호가 든 .env 는 그대로)
 #
 # 갱신 방식(중요): 본체(onedir)는 **스테이징 폴더**에 빌드한 뒤 _internal·TrdBot.exe 만
 #   배포 폴더로 교체한다. .env·config 같은 사용자 편집 파일은 절대 덮지 않는다.
@@ -69,5 +71,24 @@ New-Item -ItemType Directory -Force "$dist\config" | Out-Null
 if (-not (Test-Path "$dist\config\holidays.txt")) { Copy-Item "config\holidays.txt" "$dist\config\holidays.txt" -Force }
 if (-not (Test-Path "$dist\config\fill.wav")) { Copy-Item "config\fill.wav" "$dist\config\fill.wav" -Force }
 
+Write-Host "[압축] 배포 zip 생성..."
+# 운영 폴더에 그대로 풀어 덮어써도 안전하게: .env(계좌번호)는 빼고 빈 템플릿을 .env.template 로.
+# tokens·logs 는 위에서 이미 제거됨. 새 PC 설치 때만 .env.template → .env 로 이름 바꿔 사용.
+$stamp = $buildStamp -replace "[-: ]", ""            # 2026-10-02 16:40 → 202610021640
+$zipStage = "deploy\zip_stage"
+$zipPath = Join-Path $root "deploy\TrdBot_$($stamp.Substring(0,8))_$($stamp.Substring(8)).zip"
+Remove-Item $zipStage -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force "$zipStage\TrdBot" | Out-Null
+Get-ChildItem $dist -Force |
+    Where-Object { $_.Name -notin @(".env", "tokens", "logs") -and $_.Extension -ne ".zip" } |
+    Copy-Item -Destination "$zipStage\TrdBot" -Recurse -Force
+Copy-Item "deploy\files\.env" "$zipStage\TrdBot\.env.template" -Force
+Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+[System.IO.Compression.ZipFile]::CreateFromDirectory(
+    (Join-Path $root "$zipStage"), $zipPath, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+Remove-Item $zipStage -Recurse -Force -ErrorAction SilentlyContinue
+
 Write-Host "완료 → $dist  (이 폴더를 배포하세요)"
+Write-Host "압축 → $zipPath  (.env 제외 — 운영 폴더에 풀어 덮어써도 계좌번호 유지)"
 Write-Host "주의: 남에게 배포할 땐 .env 의 계좌번호를 비우고 tokens\ 폴더가 없는지 확인하세요."

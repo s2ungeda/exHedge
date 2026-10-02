@@ -25,6 +25,8 @@ build/
 dist/
 deploy/dist_stage/
 deploy/*.spec
+deploy/zip_stage/
+deploy/*.zip
 
 # Logs
 *.log
