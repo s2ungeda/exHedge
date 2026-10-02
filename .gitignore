@@ -1,0 +1,34 @@
+# Secrets / tokens
+.env
+.env.local
+tokens/
+*.token
+*.pem
+
+# 사용자별 화면 설정 (비밀 아님, 개인 설정이라 제외)
+config/
+
+# 백업 스냅샷
+backups/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store

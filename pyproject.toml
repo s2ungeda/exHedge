@@ -1,0 +1,71 @@
+[project]
+name = "trdbot"
+version = "0.1.0"
+description = "LS증권 OpenAPI 기반 자동매매 봇 (국내주식/ETF/선물옵션)"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.27",
+    "websockets>=12.0",
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+    "keyring>=25.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.23",
+    "rich>=13.7",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+# ──────────────────────────────────────────────────────────
+# Ruff: PEP 8 모양 + 네이밍 + 미사용 import 를 "경고"로 알려줌
+# (자동 수정 아님 — 직접 고치며 습관 들이는 용도)
+# ──────────────────────────────────────────────────────────
+[tool.ruff]
+line-length = 100          # 한 줄 최대 길이 (기본 88 → 조금 넉넉하게)
+target-version = "py310"   # requires-python = ">=3.10" 과 맞춤
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle 에러 (PEP 8 모양)
+    "W",   # pycodestyle 경고
+    "F",   # pyflakes (미사용 import/변수 등)
+    "N",   # pep8-naming (snake_case / PascalCase 네이밍 규칙) ← 핵심
+    "I",   # isort (import 정렬 순서)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 테스트 함수명은 한글로 의도(예: test_장시작이면_접속매매) — 가독성 우선이라 N802만 끔.
+"tests/**" = ["N802"]
+
+# ──────────────────────────────────────────────────────────
+# Pylint: Ruff 가 못 보는 로직/설계 경고만 담당.
+# (1) Ruff 와 겹치는 규칙  (2) 학습 초반에 시끄러운 규칙  → 끔
+# ──────────────────────────────────────────────────────────
+[tool.pylint.messages_control]
+disable = [
+    # --- Ruff 와 중복되어 끄는 것 (같은 지적 두 번 방지) ---
+    "C0103",  # invalid-name        → Ruff N 규칙이 담당
+    "C0301",  # line-too-long       → Ruff E501 이 담당
+    "W0611",  # unused-import       → Ruff F401 이 담당
+    "W0612",  # unused-variable     → Ruff F841 이 담당
+    # --- 학습 초반에 너무 시끄러운 것 ---
+    "C0114",  # missing-module-docstring
+    "C0115",  # missing-class-docstring
+    "C0116",  # missing-function-docstring
+    "R0903",  # too-few-public-methods   (작은 데이터 클래스에 자주 뜸)
+    "R0913",  # too-many-arguments
+    "W0621",  # redefined-outer-name     (pytest fixture 쓰면 자주 뜸)
+]
