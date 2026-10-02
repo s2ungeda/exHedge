@@ -138,7 +138,7 @@ def _fill_params(raw: dict[str, str]) -> tuple[float, int]:
 # 실행 중에도 변경 가능한(=적용 버튼으로 반영) 입력 키.
 # 종목코드·시간창은 실행(Ready) 중 잠금.
 LIVE_KEYS = (
-    "hedge_ratio", "manual_balance_adjust",
+    "hedge_ratio", "usd_futures_held",
     "qty_per_order", "order_interval_sec", "max_position",
     "fill_window_min", "fill_limit",
 )
@@ -147,12 +147,12 @@ LIVE_KEYS = (
 def parse_live_params(raw: dict[str, str]) -> dict:
     """실행 중 변경 가능한 7개 항목을 검증해 dict로 반환. 오류 시 ValueError.
 
-    B(헤지비율)·계좌달러노출액(±) + 1회주문계약수·주문인터벌·최대잔고한도
+    B(헤지비율)·보유 원달러(±계약수) + 1회주문계약수·주문인터벌·최대잔고한도
     + 체결감시시간(분)·체결량한도(개).
     """
     b = _num("헤지비율(B)", raw.get("hedge_ratio", ""), cast=float, minv=0)
-    adj_raw = raw.get("manual_balance_adjust", "").strip()
-    adj = _num("계좌달러노출액", adj_raw, cast=float) if adj_raw else 0.0
+    held_raw = raw.get("usd_futures_held", "").strip()
+    held = _num("보유 원달러", held_raw, cast=int) if held_raw not in ("", "-") else 0
     qty = _num("1회주문계약수", raw.get("qty_per_order", ""), cast=int, minv=2)
     interval = _num("주문 인터벌(s)", raw.get("order_interval_sec", ""), cast=float,
                     minv=0, allow_zero=False)
@@ -161,7 +161,7 @@ def parse_live_params(raw: dict[str, str]) -> dict:
     if qty > maxpos:
         raise ValueError(f"1회주문계약수({qty})가 최대잔고한도({maxpos})보다 큽니다.")
     return {
-        "hedge_ratio": b, "manual_balance_adjust": adj,
+        "hedge_ratio": b, "usd_futures_held": held,
         "qty_per_order": qty, "order_interval_sec": interval, "max_position": maxpos,
         "fill_window_min": fwin, "fill_limit": flim,
     }
@@ -432,30 +432,17 @@ class OrderScreen:
         self._lab(c, "환율").grid(row=0, column=2, sticky="e", pady=1, padx=(14, 6))
         self._display(c, "exchange_rate", width=9).grid(row=0, column=3, sticky="w", pady=1)
 
-        # 계좌달러노출액(왼쪽) + 헤지비율(오른쪽)을 한 행에 — 세로 한 칸 절약.
-        # 계좌달러노출액: 유지할 달러 노출 금액(±) → C = 계좌달러노출액 / 환율 / 10000.
-        # 금액이라 천단위 콤마 자동 — 입력할 때마다 포맷(읽는 쪽은 콤마 제거해서 float 변환).
-        self._lab(c, "계좌달러노출액( 밈:$,달:원)").grid(
+        # 보유 원달러(왼쪽) + 헤지비율(오른쪽)을 한 행에 — 세로 한 칸 절약.
+        # 보유 원달러: 유지할 원달러선물 계약수(±정수) → C = 입력값 그대로.
+        # (키를 예전 manual_balance_adjust(금액)에서 바꿈 → 저장된 옛 금액이 계약수로 읽히지 않게)
+        self._lab(c, "보유 원달러").grid(
             row=1, column=0, sticky="w", pady=1, padx=(0, 6))
         wrap = tk.Frame(c, bg=C["card"])
         wrap.grid(row=1, column=1, sticky="w", pady=1)
-        adj = self._entry(wrap, "manual_balance_adjust", "0", width=12)
-        adj.bind("<KeyRelease>", lambda _e: self._format_thousands(adj))
-        self._format_thousands(adj)      # 저장된 초기값도 콤마 표시
-        adj.pack(side="left")
+        held = self._entry(wrap, "usd_futures_held", "0", width=8)
+        held.pack(side="left")
         self._lab(c, "헤지비율").grid(row=1, column=2, sticky="e", pady=1, padx=(14, 6))
         self._pct(c, "hedge_ratio", 1, 3)
-
-    @staticmethod
-    def _format_thousands(entry: tk.Entry) -> None:
-        """금액 입력칸을 천단위 콤마로 재포맷(부호 - 유지, 숫자만 남겨 정수 콤마)."""
-        raw = entry.get()
-        neg = raw.lstrip().startswith("-")
-        digits = "".join(ch for ch in raw if ch.isdigit())
-        formatted = ("-" if neg else "") + (f"{int(digits):,}" if digits else "")
-        if formatted != raw:
-            entry.delete(0, tk.END)
-            entry.insert(0, formatted)
 
     def _pct(self, parent, key, row, col):
         wrap = tk.Frame(parent, bg=C["card"])
@@ -727,19 +714,19 @@ class OrderScreen:
         self.root.after(0, fn)
 
     def apply_signal(self, *, fx: float, total_coin: float,
-                     hedge_ratio: float, dollar_exposure: float) -> tuple[int, int, int]:
+                     hedge_ratio: float, usd_futures_held: int) -> tuple[int, int, int]:
         """외부 시그널(환율·코인포지션합) + **적용된 입력**으로 표시칸 + 목표계약수 갱신.
 
-        헤지비율·계좌달러노출액은 화면 입력칸이 아니라 **적용된 값**(app이 Ready/적용 시점에
+        헤지비율·보유 원달러는 화면 입력칸이 아니라 **적용된 값**(app이 Ready/적용 시점에
         캡처)을 인자로 받는다 — 입력 도중 값이 화면 C/D에 반영되지 않도록(적용 버튼 눌러야 갱신).
-        C = 계좌달러노출액 / 환율 / 10000, D = −(코인포지션합 × B%) / 환율 / 10000.
+        C = 보유 원달러(계약수 그대로), D = −(코인포지션합 × B%) / 환율 / 10000.
         Returns (C, D, 목표).
         """
         from trdbot.targets import target_contracts
         self.set_display("exchange_rate", f"{fx:,.2f}")
         self.set_display("total_coin", f"{total_coin:,.0f}")
         # Meme(달러·해외코인매도 다리)은 Dalin(원화·국내코인매수 다리)과 반대 다리라 D 부호 반전.
-        c, d, t = target_contracts(dollar_exposure, total_coin, hedge_ratio, fx,
+        c, d, t = target_contracts(usd_futures_held, total_coin, hedge_ratio, fx,
                                    flip_hedge=self._is_meme)
         self.set_display("dollar_contracts", str(c))
         self.set_display("hedge_contracts", str(d))

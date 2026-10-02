@@ -141,7 +141,7 @@ class TradingApp:
         self._holidays: set = set()                   # 휴일 집합(롤오버 구간 내 건너뛰기용)
         self._rollover_shown_date: object | None = None  # 롤오버 확인창 표시 리셋 기준일
         self._rollover_slots: set[str] = set()        # 오늘 이미 띄운 슬롯("0930"/"1400")
-        self._ratios = (0.0, 0.0)  # (B 헤지비율, 계좌달러노출액) — 실행 시점 캡처
+        self._ratios = (0.0, 0)  # (B 헤지비율, 보유 원달러 계약수) — 실행 시점 캡처
         self._last_signal: Signal | None = None  # 마지막 시그널(적용 시 목표 재계산용)
         self._fill_window_sec = 600.0   # 체결량 감시 시간(초). 기본 10분
         self._fill_limit = 0            # 최근 윈도우 체결량 한도(개). 0=기능 끔
@@ -335,14 +335,13 @@ class TradingApp:
 
     # ---- 실행/정지 (화면 토글 콜백) ----
     def _start(self, cfg: OrderConfig) -> None:
-        # 계좌달러노출액은 OrderConfig에 없으니 화면 입력에서 직접 읽는다.
-        # 천단위 콤마가 붙어 있으니 제거하고 변환.
+        # 보유 원달러(계약수)는 OrderConfig에 없으니 화면 입력에서 직접 읽는다.
         try:
-            exp_raw = self.screen._inputs["manual_balance_adjust"].get().replace(",", "").strip()
-            exposure = float(exp_raw) if exp_raw not in ("", "-") else 0.0
+            held_raw = self.screen._inputs["usd_futures_held"].get().replace(",", "").strip()
+            held = int(held_raw) if held_raw not in ("", "-") else 0
         except ValueError:
-            exposure = 0.0
-        self._ratios = (cfg.hedge_ratio, exposure)
+            held = 0
+        self._ratios = (cfg.hedge_ratio, held)
         self._fill_window_sec = cfg.fill_window_min * 60.0
         self._fill_limit = cfg.fill_limit
         self._trade_enabled = False   # 매 실행은 관찰모드로 시작(안전) — '주문' 체크해야 실주문
@@ -660,7 +659,7 @@ class TradingApp:
     # ---- 실행 중 설정 적용 (적용 버튼) ----
     def _on_apply(self, live: dict) -> None:
         """실행 중 변경 항목 반영 — 비율은 _ratios, 집행 파라미터는 executor에 즉시 적용."""
-        self._ratios = (live["hedge_ratio"], live["manual_balance_adjust"])
+        self._ratios = (live["hedge_ratio"], live["usd_futures_held"])
         self._fill_window_sec = live["fill_window_min"] * 60.0
         self._fill_limit = live["fill_limit"]
         ex = self.executor
@@ -672,17 +671,17 @@ class TradingApp:
         # 화면 목표계약수도 즉시 재계산(마지막 시그널 + 새로 적용된 값) → 표시와 집행 일치
         sig = self._last_signal
         if sig is not None:
-            b, exposure = self._ratios
+            b, held = self._ratios
             self.screen.apply_signal(
-                fx=sig.fx, total_coin=sig.total_coin, hedge_ratio=b, dollar_exposure=exposure)
+                fx=sig.fx, total_coin=sig.total_coin, hedge_ratio=b, usd_futures_held=held)
         logger.info("실행 중 설정 적용: %s", live)
 
     # ---- seam: 시그널 → 부호목표 ----
     def _compute_target(self, sig: Signal) -> int:
-        b, exposure = self._ratios
+        b, held = self._ratios
         # Meme(달러 기준·해외코인매도 다리)은 Dalin(원화 기준·국내코인매수 다리)과 반대 다리라 D 부호 반전.
         flip = self._signal_token == "Meme"
-        _, _, t = target_contracts(exposure, sig.total_coin, b, sig.fx, flip_hedge=flip)
+        _, _, t = target_contracts(held, sig.total_coin, b, sig.fx, flip_hedge=flip)
         return t
 
     def _in_session_window(self, cfg: OrderConfig) -> bool:
@@ -707,9 +706,9 @@ class TradingApp:
         self._last_signal = sig   # 적용 시 목표 재계산에 재사용
         # 화면 표시 갱신은 메인스레드에서 — 헤지비율·노출액은 적용된 값(_ratios)을 넘김
         # (입력칸을 실시간으로 읽지 않음 → 입력 도중 값이 C/D에 반영되지 않게).
-        b, exposure = self._ratios
+        b, held = self._ratios
         self.screen.post(lambda: self.screen.apply_signal(
-            fx=sig.fx, total_coin=sig.total_coin, hedge_ratio=b, dollar_exposure=exposure))
+            fx=sig.fx, total_coin=sig.total_coin, hedge_ratio=b, usd_futures_held=held))
         # 집행 엔진에 전달
         if self.executor:
             self.executor.on_signal(sig)

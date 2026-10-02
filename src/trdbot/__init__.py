@@ -9,11 +9,7 @@ from trdbot.executor import BrokerPort, Decision, Executor, reconcile_plan
 from trdbot.order_screen import OrderConfig, OrderScreen, build_config
 from trdbot.pricing import PriceQuote, order_price, quote_from_orderbook
 from trdbot.signal_link import Signal, SignalLink, parse_signal
-from trdbot.targets import (
-    dollar_exposure_contracts,
-    hedge_ratio_contracts,
-    target_contracts,
-)
+from trdbot.targets import hedge_ratio_contracts, target_contracts
 
 __all__ = [
     "BrokerPort",
@@ -28,7 +24,6 @@ __all__ = [
     "Signal",
     "SignalLink",
     "build_config",
-    "dollar_exposure_contracts",
     "hedge_ratio_contracts",
     "order_price",
     "parse_signal",
