@@ -18,6 +18,7 @@ import logging
 from typing import Callable, Literal
 
 from lsapi.futures import FuturesAPI, NightFuturesAPI, session_now
+from lsapi.util import redact
 from trdbot.datastore import MarketDataStore
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,32 @@ Side = Literal["buy", "sell"]
 
 # 미국달러선물 1계약 호가단위(실측). 호가 성길 때 폴백.
 USD_FUTURES_TICK = 0.10
+
+
+def _log_order_resp(tr: str, resp: dict, side: str, qty: int, price: float, code: str) -> None:
+    """주문 응답 한 줄 — 주문번호·응답코드·OutBlock2 원문(비번 마스킹).
+
+    거부가 OutBlock을 동봉해 오면(야간 02752 증거금부족 실측) 예외 없이 지나가므로,
+    응답 원문을 남겨야 주문번호가 실제로 무엇이었는지 사후에 확인할 수 있다.
+    """
+    out2 = resp.get(f"{tr}OutBlock2", {})
+    logger.info("주문응답 #%s %s %d@%s %s [%s %s] OutBlock2=%s",
+                out2.get("OrdNo"), side, qty, price, code,
+                resp.get("rsp_cd"), resp.get("rsp_msg"), redact(out2))
+
+
+def _cancel(store: MarketDataStore, api, code: str, order_no: str) -> None:
+    """미체결 잔량 취소(주간·야간 공통). 요청·응답·생략을 모두 로그로 남긴다."""
+    found = store.find_open(order_no)
+    if found is None:
+        logger.info("취소 생략 #%s — 미체결·pending에 없음(이미 체결/취소/소멸)", order_no)
+        return
+    target = found["expcode"] or code
+    logger.info("취소요청 #%s 잔%d %s", order_no, found["remaining"], target)
+    resp = api.cancel_order(target, int(order_no), found["remaining"])
+    logger.info("취소응답 #%s [%s %s]", order_no, resp.get("rsp_cd"), resp.get("rsp_msg"))
+    store.drop_pending(order_no)          # pending이었으면 in-flight에서 제거
+    store.invalidate_open_orders()        # 취소 → 미체결 변동
 
 
 class LSDayFuturesBroker:
@@ -75,6 +102,7 @@ class LSDayFuturesBroker:
 
     def place_order(self, side: Side, qty: int, price: float) -> str:
         resp = self.api.place_order(self.code, qty, side=side, kind="limit", price=price)
+        _log_order_resp("CFOAT00100", resp, side, qty, price, self.code)
         ordno = resp.get("CFOAT00100OutBlock2", {}).get("OrdNo")
         if ordno is None:
             raise RuntimeError(f"주문번호 없음: {resp.get('rsp_msg')}")
@@ -88,13 +116,7 @@ class LSDayFuturesBroker:
 
         막 낸 주문이 t0434에 아직 안 떠도 취소가 되어야 함 — 안 그러면 취소 누락으로 주문이 쌓인다.
         """
-        oid = str(order_no)
-        found = self._store.find_open(oid)
-        if found is None:
-            return   # 이미 체결/취소/소멸 → no-op
-        self.api.cancel_order(found["expcode"] or self.code, int(oid), found["remaining"])
-        self._store.drop_pending(oid)          # pending이었으면 in-flight에서 제거
-        self._store.invalidate_open_orders()   # 취소 → 미체결 변동
+        _cancel(self._store, self.api, self.code, str(order_no))
 
     def cancel_all_unfilled(self) -> int:
         """이 종목군(position_prefix)의 미체결 주문을 전부 취소. 취소 건수 반환.
@@ -153,6 +175,7 @@ class LSNightFuturesBroker:
 
     def place_order(self, side: Side, qty: int, price: float) -> str:
         resp = self.api.place_order(self.code, qty, side=side, kind="limit", price=price)
+        _log_order_resp("CCENT00100", resp, side, qty, price, self.code)
         ordno = resp.get("CCENT00100OutBlock2", {}).get("OrdNo")
         if ordno is None:
             raise RuntimeError(f"야간 주문번호 없음: {resp.get('rsp_msg')}")
@@ -162,13 +185,7 @@ class LSNightFuturesBroker:
 
     def cancel(self, order_no: str) -> None:
         """미체결 잔량 취소. 캐시·pending에서 찾아 취소(막 낸 야간주문도 취소 가능)."""
-        oid = str(order_no)
-        found = self._store.find_open(oid)
-        if found is None:
-            return   # 이미 체결/취소/소멸 → no-op
-        self.api.cancel_order(found["expcode"] or self.code, int(oid), found["remaining"])
-        self._store.drop_pending(oid)
-        self._store.invalidate_open_orders()
+        _cancel(self._store, self.api, self.code, str(order_no))
 
     def cancel_all_unfilled(self) -> int:
         """이 종목군의 야간 미체결을 전부 취소(저장소 기준). 취소 건수 반환."""

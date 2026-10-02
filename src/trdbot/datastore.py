@@ -117,9 +117,12 @@ class MarketDataStore:
         c01 = self._c01_net()
         now = self._clock()
         with self._lock:
+            prev = None if self._baseline is None else self._baseline + (c01 - self._baseline_net)
             self._baseline = net
             self._baseline_net = c01
             self._baseline_at = now
+        logger.info("포지션 앵커(%s): net=%d (C01 기준 %d, 앵커 직전 추정 %s)",
+                    "야간잔고" if self._session() == "night" else "t0441", net, c01, prev)
 
     def net_position(self) -> int:
         """순포지션 = 시작값(t0441) + C01 실시간 증감. 자동 재동기화는 하지 않는다.
@@ -141,6 +144,7 @@ class MarketDataStore:
 
     def resync_position(self) -> None:
         """다음 net_position 때 t0441 재동기화(수동조회용)."""
+        logger.info("포지션 재동기화 요청 — 다음 조회 때 잔고(t0441)로 다시 앵커")
         self._baseline = None
 
     def positions(self) -> list[dict]:

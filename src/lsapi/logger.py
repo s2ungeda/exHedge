@@ -24,6 +24,9 @@ def setup_logging(level: str | None = None) -> None:
     root = logging.getLogger()
     root.handlers.clear()
     root.setLevel(lvl)
+    # httpx는 요청마다 INFO 한 줄(하루 수천 줄)이라 중요한 줄이 묻힌다. HTTP 오류는
+    # client.py가 경고/예외로 따로 남기므로 WARNING 이상만 둔다.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     stream = logging.StreamHandler(sys.stderr)
     stream.setFormatter(fmt)

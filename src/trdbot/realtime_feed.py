@@ -194,7 +194,8 @@ class RealtimeFeed:
         self._c01_net += signed
         self._c01_seen = True
         self._record_fill(body, signed)  # 체결 누적(중앙저장소용)
-        logger.info("C01 체결: %s %+d → 누적 net=%d", expcode, signed, self._c01_net)
+        logger.info("C01 체결: #%s %s %+d @%s → 누적 net=%d", body.get("ordno"), expcode, signed,
+                    body.get("cheprice"), self._c01_net)
         if self._on_fill:
             try:
                 self._on_fill(str(body.get("ordno", "")), abs(signed))  # 미체결 즉시 차감
@@ -219,6 +220,10 @@ class RealtimeFeed:
         tr = str(msg.get("header", {}).get("tr_cd") or "")
         if tr in (O01_ACCEPT_NOTICE, O02_NIGHT_ACCEPT):
             rec = self._parse_accept(body)
+            if rec is not None:
+                logger.info("%s 접수: #%s %s 잔%d @%s%s", tr, rec["ordno"], rec["medosu"],
+                            rec["ordrem"], rec["price"],
+                            f" (정정 원주문 #{rec['orgordno']})" if rec["orgordno"] else "")
             if rec is not None and self._on_accept:
                 try:
                     self._on_accept(rec)
@@ -226,6 +231,7 @@ class RealtimeFeed:
                     logger.exception("O01 on_accept 예외")
         elif tr in (H01_MODIFY_NOTICE, H02_NIGHT_MODIFY):
             org = self._cancel_ordno(body)
+            logger.info("%s 정정취소: 원주문 #%s", tr, org)
             if org.strip().lstrip("0") and self._on_cancel:
                 try:
                     self._on_cancel(org)

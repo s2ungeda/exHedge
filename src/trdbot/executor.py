@@ -241,6 +241,7 @@ class Executor:
         self._converged = False
         self._last_target: int | None = None
         self._last_emit: str | None = None   # 마지막 표시 메시지(연속 중복 방지)
+        self._last_log: dict[str, str | None] = {}   # 판단 로그 종류별 마지막 내용(바뀔 때만 기록)
         self._placed_at: dict[str, float] = {}   # 우리가 낸 주문번호 → 시각(인터벌 게이트용)
         self._canceling: set[str] = set()   # 취소 요청 후 확인(사라짐) 대기 중인 주문(정규화)
         self._reject_streak = 0   # 연속 주문거부 횟수(백오프 증가용) — 성공 시 0으로 리셋
@@ -272,6 +273,7 @@ class Executor:
             return ReconcileResult(Decision("skip", "주문가능시간 외"))
 
         target = self.compute_target(sig)
+        self._log_change("target", f"목표계약수 {target}")
         position = self.broker.get_position()
         if self.on_position:
             try:
@@ -323,7 +325,7 @@ class Executor:
         if open_orders:
             gap = target - position
             need_side: Side | None = "buy" if gap > 0 else "sell" if gap < 0 else None
-            newly = 0
+            cancelled: list[str] = []
             for o in open_orders:
                 oid = _norm_ordno(o["ordno"])
                 if oid in self._canceling:
@@ -335,12 +337,18 @@ class Executor:
                     try:
                         self.broker.cancel(str(o["ordno"]))
                         self._canceling.add(oid)
-                        newly += 1
+                        cancelled.append(f"#{o['ordno']}")
                     except Exception:
                         logger.exception("주문 취소 실패 ordno=%s", o["ordno"])
+            newly = len(cancelled)
             if newly:
-                self._emit(f"미체결 {newly}건 취소 요청(인터벌 경과/반대) — 취소 확인 대기")
+                self._emit(f"미체결 {newly}건 취소 요청 [{', '.join(cancelled)}]"
+                           f"(인터벌 경과/반대) — 취소 확인 대기")
             dec = Decision("skip", "취소 확인 대기" if self._canceling else "체결 대기")
+            orders = ", ".join(f"#{o['ordno']} {o['side']} 잔{o['remaining']} @{o['price']}"
+                               for o in open_orders)
+            self._log_change("state", f"대기({dec.reason}): 미체결 [{orders}] "
+                                      f"(목표 {target}, 포지션 {position})")
             self._log_quote(buy_q, sell_q, buy_price, sell_price, target, position, dec)
             return ReconcileResult(dec, cancelled=newly, kept_open=len(open_orders))
 
@@ -366,9 +374,13 @@ class Executor:
                 return ReconcileResult(rej, kept_open=0, rejected=True)
             if order_no:
                 self._placed_at[str(order_no)] = self._clock()
-            self._emit(f"주문 {dec.side} {dec.qty}@{dec.price} (목표 {target}, 포지션 {position})")
+            self._emit(f"주문 {dec.side} {dec.qty}@{dec.price} #{order_no} "
+                       f"(목표 {target}, 포지션 {position})")
+            self._last_log["state"] = None   # 주문 뒤 첫 대기/수렴은 다시 기록
         elif dec.action == "skip":
             self._emit(f"⚠ 주문 보류 — {dec.reason} (목표 {target}, 포지션 {position})")
+        else:
+            self._log_change("state", f"{dec.reason} (목표 {target}, 포지션 {position})")
         return ReconcileResult(dec, kept_open=0, order_no=order_no)
 
     # ---- 루프 (이벤트 기반) ----
@@ -382,7 +394,11 @@ class Executor:
                 self._new_signal = False
 
             # 시그널 없음/주문가능시간 밖 → 폴링 안 함, 다음 시그널까지 대기
-            if sig is None or not self.in_window():
+            in_win = sig is not None and self.in_window()
+            if sig is not None:
+                self._log_change("window", "주문가능 구간" if in_win
+                                 else "주문가능 구간 밖(시간외/동시호가/장운영) — 신규 주문 중지")
+            if not in_win:
                 self._idle_wait()
                 continue
 
@@ -491,6 +507,13 @@ class Executor:
             })
         except Exception:
             logger.exception("on_quote 예외")
+
+    def _log_change(self, kind: str, msg: str) -> None:
+        """판단 과정 로그(파일 전용) — 같은 종류의 내용이 바뀔 때만 남긴다(사이클마다 반복 방지)."""
+        if self._last_log.get(kind) == msg:
+            return
+        self._last_log[kind] = msg
+        logger.info("[executor] %s", msg)
 
     def _emit(self, msg: str) -> None:
         logger.info("[executor] %s", msg)
