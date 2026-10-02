@@ -201,6 +201,8 @@ class RealtimeFeed:
         if self._prefix not in expcode:  # 우리 종목군만(표준코드에 단축코드 접두 포함)
             return
         body = msg.get("body") or {}
+        # ⚠️ 순서 불변식: net(포지션)을 **먼저** 올리고 그다음 _on_fill(미체결 제거).
+        # MarketDataStore.snapshot()이 미체결→포지션 순으로 읽어 체결 누락 틈을 막는 근거 — 바꾸지 말 것.
         self._c01_net += signed
         self._c01_seen = True
         self._record_fill(body, signed)  # 체결 누적(중앙저장소용)

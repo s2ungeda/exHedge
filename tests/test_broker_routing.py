@@ -159,7 +159,10 @@ def test_cancel_막낸주문_pending도_취소():
     store.note_placed("5001", "buy", 3, 1380.3)    # 막 낸 주문(t0434 미반영)
     broker.cancel("5001")
     assert ("A7567000", 5001, 3) in api.cancelled  # 우리 종목코드로 취소됨
-    assert store.find_open("5001") is None         # pending에서 제거(더는 in-flight 아님)
+    # 취소 '요청'만으로는 장부에서 안 뺀다 — 엇갈려 체결된 주문이 C01 전에 빠지면 중복주문.
+    assert store.find_open("5001") is not None
+    store.apply_cancel("5001")                     # H01 취소확인 통보 → 그때 제거
+    assert store.find_open("5001") is None
 
 
 def test_cancel_t0434주문은_캐시값으로():
@@ -236,13 +239,15 @@ def test_야간_주문하면_pending에_뜨고_미체결조회로_보인다():
     assert any(o["ordno"] == "7001" for o in broker.get_open_orders())   # pending으로 보임
 
 
-def test_야간_취소하면_야간TR로_취소하고_pending제거():
+def test_야간_취소하면_야간TR로_취소_H02확인때_제거():
     api = FakeNightAPI()
     broker, store = _night_broker(api)
     broker.place_order("buy", 1, 1528.6)
     broker.cancel("7001")
     assert ("A7567000", 7001, 1) in api.cancelled   # 야간 취소 TR(CCENT00300) 호출
-    assert store.find_open("7001") is None           # pending에서 제거
+    assert store.find_open("7001") is not None       # 요청만으론 장부 유지(H02 확인 대기)
+    store.apply_cancel("7001")                       # H02 취소확인 → 제거
+    assert store.find_open("7001") is None
 
 
 def test_야간_포지션은_CCENQ90200을_정규화해_계산():

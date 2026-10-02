@@ -63,8 +63,8 @@ def _cancel(store: MarketDataStore, api, code: str, order_no: str) -> None:
     logger.info("취소요청 #%s 잔%d %s", order_no, found["remaining"], target)
     resp = api.cancel_order(target, int(order_no), found["remaining"])
     logger.info("취소응답 #%s [%s %s]", order_no, resp.get("rsp_cd"), resp.get("rsp_msg"))
-    store.drop_pending(order_no)          # pending이었으면 in-flight에서 제거
-    store.invalidate_open_orders()        # 취소 → 미체결 변동
+    store.mark_cancel_requested(order_no)  # 장부엔 남김 — H01 취소확인/C01 체결 통보로 제거
+    store.invalidate_open_orders()         # 취소 → 미체결 변동
 
 
 class LSDayFuturesBroker:
@@ -105,6 +105,10 @@ class LSDayFuturesBroker:
     def get_open_orders(self) -> list[dict]:
         """미체결 [{ordno, side, remaining, price}] — 중앙저장소(t0434 캐시)."""
         return self._store.open_orders_exec()
+
+    def get_snapshot(self) -> tuple[int, list[dict]]:
+        """(포지션, 미체결) — 체결 누락 틈 없는 순서로 함께 읽음(store.snapshot 참고)."""
+        return self._store.snapshot()
 
     def invalidate_open_orders(self) -> None:
         self._store.invalidate_open_orders()
@@ -175,6 +179,10 @@ class LSNightFuturesBroker:
     def get_open_orders(self) -> list[dict]:
         """미체결 [{ordno, side, remaining, price}] — 중앙저장소(pending + C02/O02/H02)."""
         return self._store.open_orders_exec()
+
+    def get_snapshot(self) -> tuple[int, list[dict]]:
+        """(포지션, 미체결) — 체결 누락 틈 없는 순서로 함께 읽음(store.snapshot 참고)."""
+        return self._store.snapshot()
 
     def invalidate_open_orders(self) -> None:
         self._store.invalidate_open_orders()
@@ -252,6 +260,11 @@ class SessionRoutingBroker:
         # 야간만 야간 브로커로 라우팅(예외 안 던짐).
         self._pinned = self.night if self.session() == "night" else self.day
         return self._pinned.get_position()
+
+    def get_snapshot(self) -> tuple[int, list[dict]]:
+        """집행 사이클 시작 — get_position처럼 세션을 다시 고정하고 (포지션, 미체결)을 읽는다."""
+        self._pinned = self.night if self.session() == "night" else self.day
+        return self._pinned.get_snapshot()
 
     def place_order(self, side: Side, qty: int, price: float) -> str:
         return self._active().place_order(side, qty, price)

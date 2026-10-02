@@ -64,10 +64,14 @@ class MarketDataStore:
         self._open_dirty = True
         self._min_refetch = 1.0              # t0434 재조회 최소 간격(초) — 체결 폭주 시 accno 보호
         self._force_open = False             # True면 쓰로틀 무시하고 즉시 재조회(체결 직후용)
-        # 막 낸 주문(아직 t0434 미반영) — 이중주문 방지용 in-flight.
-        # t0434 확인 / 체결(C01·C02) / 취소(H01·H02) 통보로만 제거. TTL로는 안 지운다
-        # → 통보가 없으면 남아서 다음 주문을 막는다(상태 불명 시 주문 폭주 방지).
+        # 발주 장부 — 살아있는 우리 종목 주문(막 낸 주문·접수·t0434에서 본 주문). 이중주문 방지.
+        # **체결(C01·C02) 전량 / 취소확인(H01·H02) 통보로만 제거.** t0434에서 사라졌다고 바로
+        # 지우지 않는다: t0434가 C01보다 먼저 체결을 반영하면, 포지션엔 아직 없는데 미체결에서도
+        # 빠져 같은 주문이 또 나간다(운영로그 2026-09 중복주문). 통보가 끝내 안 오면(누락)
+        # 한 번 t0434에서 봤거나 취소 요청한 주문이 _stale_sec 넘게 t0434에 없을 때만 지우고
+        # 포지션을 t0441로 다시 앵커한다.
         self._pending: dict[str, dict] = {}
+        self._stale_sec = 30.0
         # C01 전량체결로 사라진 주문번호(정규화) → 시각. t0434가 늦게 갱신돼도 재등장 막음(억제).
         self._suppress: dict[str, float] = {}
         self._suppress_ttl = 5.0
@@ -185,18 +189,47 @@ class MarketDataStore:
                                   if _norm_ordno(r.get("ordno")) not in self._suppress]
                 self._open_at = now
                 self._open_dirty = False
-                # pending 제거는 **확인된 경우만**: t0434에 뜸 / 체결통보(C01·C02) 완료.
-                # TTL 만료로는 안 지운다 — 통보가 없으면 "미해소"로 남아 다음 주문을 막는다
-                # (통보 두절 시 주문 폭주 방지. 상태를 모르면 새 주문을 안 내는 게 안전).
-                open_ids = {str(r.get("ordno")) for r in raw}
-                kept = {}
-                for k, v in self._pending.items():
-                    if k in open_ids:
-                        continue   # t0434에 떴음 → 이제 t0434가 추적
-                    if filled.get(_norm_ordno(k), 0) >= v["remaining"]:
-                        continue   # 체결 완료 → 포지션(C01)에 반영됨
-                    kept[k] = v
-                self._pending = kept
+                self._pending, stale = self._reconcile_ledger(filled, now)
+                if stale:
+                    self._baseline = None   # 통보 누락 → 다음 조회 때 t0441로 다시 앵커
+            for k in stale:
+                logger.warning("장부: #%s 통보 없이 t0434에서 %.0f초 넘게 사라짐 → 제거, "
+                               "포지션 t0441 재앵커", k, self._stale_sec)
+
+    def _reconcile_ledger(self, filled: dict[str, int], now: float) -> tuple[dict, list[str]]:
+        """t0434 스냅샷(_open_raw)과 장부 대조(lock 안에서 호출). (새 장부, 오래 사라진 주문) 반환.
+
+        - t0434에 있음 → seen 표시(사라짐 타이머 해제)
+        - C01 누적 체결 ≥ 주문수량 → 체결 완료(포지션에 반영됨) → 제거
+        - t0434에 없음 → 그대로 유지(통보 대기). 단 seen/취소요청 주문이 _stale_sec 넘게 없으면 제거
+        - t0434에만 있는 주문(기동 전 주문 등) → 장부에 편입(이후 같은 규칙)
+        """
+        snap = {_norm_ordno(r.get("ordno")): r for r in self._open_raw}
+        kept: dict[str, dict] = {}
+        stale: list[str] = []
+        for k, v in self._pending.items():
+            nk = _norm_ordno(k)
+            if nk in snap:
+                v["seen"] = True
+                v.pop("missing_since", None)
+            elif filled.get(nk, 0) >= v.get("qty", v["remaining"]):
+                continue
+            elif v.get("seen") or v.get("cancel_requested"):
+                since = v.setdefault("missing_since", now)
+                if now - since >= self._stale_sec:
+                    stale.append(k)
+                    continue
+            kept[k] = v
+        have = {_norm_ordno(k) for k in kept}
+        for nk, r in snap.items():
+            rem = int(r.get("ordrem", 0) or 0)
+            if nk not in have and rem > 0:
+                kept[str(r.get("ordno"))] = {
+                    "side": "buy" if "매수" in str(r.get("medosu", "")) else "sell",
+                    "remaining": rem, "qty": rem, "price": float(r.get("price", 0) or 0),
+                    "expcode": str(r.get("expcode") or ""), "ts": now, "seen": True,
+                }
+        return kept, stale
 
     def _fills_by_ordno(self) -> dict[str, int]:
         """C01 누적 체결을 주문번호별 합으로 — pending 체결완료 판정용."""
@@ -213,7 +246,7 @@ class MarketDataStore:
         """막 낸 주문을 in-flight로 등록 — t0434에 뜨기 전에도 이중주문 안 나가게."""
         with self._lock:
             self._pending[str(ordno)] = {
-                "side": side, "remaining": int(qty), "price": float(price),
+                "side": side, "remaining": int(qty), "qty": int(qty), "price": float(price),
                 "expcode": expcode, "ts": self._clock(),
             }
 
@@ -233,10 +266,17 @@ class MarketDataStore:
                 return {"expcode": "", "remaining": int(p["remaining"])}  # 우리 주문 → 호출측 code
         return None
 
-    def drop_pending(self, ordno: str) -> None:
-        """취소된 주문을 pending(in-flight)에서 제거 — 더는 미체결로 안 세도록."""
+    def mark_cancel_requested(self, ordno: str) -> None:
+        """취소 요청 표시 — 장부에서 지우지는 않는다(H01 취소확인/C01 체결로 지움).
+
+        요청 직후 지우면, 취소와 엇갈려 체결된 주문이 C01 도착 전 미체결에서 빠져 같은 주문이
+        또 나간다. 표시는 '통보 없이 t0434에서도 사라짐'을 오래된 주문으로 정리하는 근거.
+        """
+        nid = _norm_ordno(ordno)
         with self._lock:
-            self._pending.pop(str(ordno), None)
+            for k, v in self._pending.items():
+                if _norm_ordno(k) == nid:
+                    v["cancel_requested"] = True
 
     def apply_accept(self, rec: dict) -> None:
         """O01 접수 → 미체결에 **즉시 추가**(pending에). 실시간 미체결 목록.
@@ -255,11 +295,15 @@ class MarketDataStore:
                 for k in [k for k in self._pending if _norm_ordno(k) == org]:
                     del self._pending[k]
                 self._suppress[org] = self._clock()
+            prev: dict = {}
             for k in [k for k in self._pending if _norm_ordno(k) == nid]:
-                del self._pending[k]
+                prev = self._pending.pop(k)
+            rem = int(rec.get("ordrem", 0) or 0)
             self._pending[str(rec.get("ordno"))] = {
+                **prev,   # 막 낸 주문이면 qty·seen·취소요청 표시 유지
                 "side": "buy" if "매수" in str(rec.get("medosu", "")) else "sell",
-                "remaining": int(rec.get("ordrem", 0) or 0),
+                "remaining": rem,
+                "qty": prev.get("qty", rem),
                 "price": float(rec.get("price", 0) or 0),
                 "expcode": str(rec.get("expcode", "")),
                 "ts": self._clock(),
@@ -326,12 +370,25 @@ class MarketDataStore:
             raw = list(self._open_raw)
             pend = dict(self._pending)
         out = [self._to_exec(r) for r in raw if int(r.get("ordrem", 0) or 0) > 0]
-        have = {o["ordno"] for o in out}
+        have = {_norm_ordno(o["ordno"]) for o in out}
         for oid, p in pend.items():
-            if oid not in have:   # t0434에 아직 없으면 pending으로 채움(이중주문 방지)
+            # t0434에 없는 장부 주문(막 낸 주문·통보 대기 중 사라진 주문)도 미체결로 센다
+            if _norm_ordno(oid) not in have and int(p.get("remaining", 0) or 0) > 0:
                 out.append({"ordno": oid, "side": p["side"],
                             "remaining": p["remaining"], "price": p["price"]})
         return out
+
+    def snapshot(self) -> tuple[int, list[dict]]:
+        """집행용 (포지션, 미체결)을 **미체결 먼저 → 포지션 순서로** 읽는다.
+
+        체결(C01) 처리는 C01 net(포지션)을 먼저 올리고 그다음 미체결에서 뺀다
+        (realtime_feed._on_c01 → app._on_fill → apply_fill). 그래서 이 순서로 읽으면 체결 하나가
+        '미체결에서도 빠지고 포지션에도 없는' 틈이 생기지 않는다(둘 다에 잡히는 건 미체결이 남아
+        새 주문을 막으므로 안전). 반대 순서(포지션 → t0434 조회 ~1초 → 미체결)로 읽던 게
+        운영로그 2026-09 중복주문(목표 ±2 진동)의 원인.
+        """
+        orders = self.open_orders_exec()
+        return self.net_position(), orders
 
     def open_orders(self, *, ensure: bool = True) -> list[dict]:
         """표시용 미체결(t0434 행 + pending). 통보로 추가된 막 낸/접수 주문도 즉시 보이게.

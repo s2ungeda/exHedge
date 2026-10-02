@@ -274,19 +274,21 @@ class Executor:
 
         target = self.compute_target(sig)
         self._log_change("target", f"목표계약수 {target}")
-        position = self.broker.get_position()
+        # 주문 비활성(관찰모드): 주문 로직(미체결·호가 조회, 계획, 취소/주문)을 아예 돌리지 않는다.
+        # 화면 포지션만 갱신하고 끝 — 시도가 없으니 로그도 없다. 활성화하면 wake로 즉시 재개.
+        trading = self.trade_enabled()
+        if trading:
+            position, open_orders = self._read_state()
+        else:
+            position = self.broker.get_position()
         if self.on_position:
             try:
                 self.on_position(position)
             except Exception:
                 logger.exception("on_position 예외")
-
-        # 주문 비활성(관찰모드): 주문 로직(미체결·호가 조회, 계획, 취소/주문)을 아예 돌리지 않는다.
-        # 화면 포지션만 갱신하고 끝 — 시도가 없으니 로그도 없다. 활성화하면 wake로 즉시 재개.
-        if not self.trade_enabled():
+        if not trading:
             return ReconcileResult(Decision("stop", "주문 비활성(관찰)"), kept_open=0)
 
-        open_orders = self.broker.get_open_orders()
         ob = self.broker.get_orderbook()
         buy_q = quote_from_orderbook(ob, "buy", fallback_tick=self.fallback_tick)
         sell_q = quote_from_orderbook(ob, "sell", fallback_tick=self.fallback_tick)
@@ -382,6 +384,19 @@ class Executor:
         else:
             self._log_change("state", f"{dec.reason} (목표 {target}, 포지션 {position})")
         return ReconcileResult(dec, kept_open=0, order_no=order_no)
+
+    def _read_state(self) -> tuple[int, list[dict]]:
+        """(포지션, 미체결) — **미체결을 먼저, 포지션을 나중에** 읽는다.
+
+        포지션을 먼저 읽고 미체결(t0434 ~1초)을 읽으면, 그 사이 도착한 직전 주문 체결이
+        미체결에선 빠지고 포지션엔 없어 같은 주문이 또 나간다(운영로그 2026-09 목표 ±2 진동).
+        브로커가 get_snapshot을 주면 그걸 쓰고(세션 고정 포함), 없으면 같은 순서로 직접 읽는다.
+        """
+        snap = getattr(self.broker, "get_snapshot", None)
+        if snap is not None:
+            return snap()
+        open_orders = self.broker.get_open_orders()
+        return self.broker.get_position(), open_orders
 
     # ---- 루프 (이벤트 기반) ----
     def run(self) -> None:
