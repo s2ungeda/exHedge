@@ -34,12 +34,16 @@ class LSWebSocket:
         *,
         name: str = "WS",
         on_disconnect: Callable[[], None] | None = None,
+        on_reconnect: Callable[[], None] | None = None,
     ):
         self.settings = settings or get_settings()
         self.tokens = token_manager or TokenManager(self.settings)
         self._name = name  # 로그 식별용(시세/장운영/체결) — 어느 소켓이 끊겼는지 구분
-        # 연결이 끊길 때(끊김·강제재연결) 1회 호출 — 예: 장운영 소켓이 끊기면 stale 국면 리셋.
+        # 예기치 않게 끊길 때 1회 호출 — 예: 장운영 소켓이 끊기면 stale 국면 리셋.
         self._on_disconnect = on_disconnect
+        # 예기치 않은 끊김 뒤 재연결·재구독에 성공하면 1회 호출 — 예: 연결 알람 해제.
+        # (의도된 재연결(토큰 갱신)은 끊김 콜백이 없었으므로 이것도 부르지 않는다.)
+        self._on_reconnect = on_reconnect
 
         self._subscriptions: list[tuple[str, str, str]] = []  # (tr_type, tr_cd, key)
         self._handlers: dict[str, Handler] = {}
@@ -93,6 +97,7 @@ class LSWebSocket:
         self._stop_evt = asyncio.Event()
         self._reconnect_evt = asyncio.Event()
         attempt = 0  # 0=최초 연결, >0=재연결 — 재연결 성공을 명확히 로그로 남기기 위함
+        lost = False  # 예기치 않게 끊긴 뒤 아직 복구 안 됨(복구 시 on_reconnect 1회)
         while self._running:
             forced = False
             connected = False
@@ -108,6 +113,13 @@ class LSWebSocket:
                         logger.info("[%s] WS 재연결됨 — 구독 재등록 완료(%d회째 시도)",
                                     self._name, attempt)
                     attempt = 0
+                    if lost:
+                        lost = False
+                        if self._on_reconnect is not None:
+                            try:
+                                self._on_reconnect()
+                            except Exception:
+                                logger.exception("[%s] on_reconnect 콜백 예외", self._name)
                     await self._recv_until_stop(ws)
                     if self._reconnect_evt.is_set():
                         forced = True                 # 의도된 재연결(토큰 갱신 등) → 즉시 재구독
@@ -124,11 +136,13 @@ class LSWebSocket:
                 # 예기치 않은 끊김일 때만 콜백(예: stale 국면 리셋). **의도된 재연결(forced,
                 # 토큰갱신·주간장 시작)은 제외** — 시장상태는 그대로라 방금 받은 JIF 국면을 버리면 안 됨.
                 # (실측 버그: 08:45 JIF continuous 수신 직후 주간장-시작 재연결이 그 국면을 리셋 → 폴백)
-                if connected and self._running and not forced and self._on_disconnect is not None:
-                    try:
-                        self._on_disconnect()
-                    except Exception:
-                        logger.exception("[%s] on_disconnect 콜백 예외", self._name)
+                if connected and self._running and not forced:
+                    lost = True
+                    if self._on_disconnect is not None:
+                        try:
+                            self._on_disconnect()
+                        except Exception:
+                            logger.exception("[%s] on_disconnect 콜백 예외", self._name)
             if not self._running:
                 break
             if forced:

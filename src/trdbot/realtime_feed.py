@@ -74,6 +74,7 @@ class RealtimeFeed:
         on_accept: Callable[[dict], None] | None = None,   # O01 접수 → 미체결 추가
         on_cancel: Callable[[str], None] | None = None,     # H01 정정취소 → 미체결 제거
         on_disconnect: Callable[[str], None] | None = None,  # 예기치 않은 WS 끊김(소켓명) → 알람
+        on_reconnect: Callable[[str], None] | None = None,   # 끊김 뒤 복구(소켓명) → 알람 해제
         token_manager: Any = None,   # REST와 공유하면 토큰 재발급이 WS에도 즉시 반영됨
     ):
         # code: 호가를 구독할 종목 단축코드(예: 'A7567000' 미국달러선물 근월).
@@ -91,6 +92,7 @@ class RealtimeFeed:
         self._on_accept = on_accept   # O01 접수 → 미체결 추가
         self._on_cancel = on_cancel   # H01 정정취소 → 미체결 제거
         self._on_ws_disconnect = on_disconnect   # 예기치 않은 끊김 → 상위(app) 알람
+        self._on_ws_reconnect = on_reconnect     # 끊김 뒤 복구 → 상위(app) 알람 해제
         self._fills: list[dict] = []  # 체결 누적(실행 이후) — 중앙저장소/모니터용
         self._fills_lock = threading.Lock()
         self.tracker = MarketStateTracker()
@@ -134,6 +136,14 @@ class RealtimeFeed:
                 self._on_ws_disconnect(name)
             except Exception:
                 logger.exception("on_ws_disconnect 예외")
+
+    def _notify_ws_reconnect(self, name: str) -> None:
+        """끊겼던 WS 복구 → 상위(app) 콜백(상태 알람 해제)."""
+        if self._on_ws_reconnect:
+            try:
+                self._on_ws_reconnect(name)
+            except Exception:
+                logger.exception("on_ws_reconnect 예외")
 
     def _on_jif_disconnect(self) -> None:
         """장운영(JIF) WS 끊김 → 저장된 국면 리셋. 다음 JIF 이벤트 전까지 시각 폴백에 맡긴다.
@@ -300,21 +310,24 @@ class RealtimeFeed:
         wss: list[LSWebSocket] = []
 
         ws_quote = LSWebSocket(self._settings, token_mgr, name="시세",   # 호가(FH9)
-                               on_disconnect=lambda: self._notify_ws_disconnect("시세"))
+                               on_disconnect=lambda: self._notify_ws_disconnect("시세"),
+                               on_reconnect=lambda: self._notify_ws_reconnect("시세"))
         ws_quote.on(FH9_DAY_ORDERBOOK, self._on_quote)
         ws_quote.subscribe(FH9_DAY_ORDERBOOK, self.code)
         wss.append(ws_quote)
 
         # JIF는 엣지 트리거라, 끊기면 직전 국면이 stale로 남는다 → 끊김 시 트래커 리셋(시각 폴백 전환).
         ws_jif = LSWebSocket(self._settings, token_mgr, name="장운영",
-                             on_disconnect=self._on_jif_disconnect)  # JIF — 다른 그룹
+                             on_disconnect=self._on_jif_disconnect,  # JIF — 다른 그룹
+                             on_reconnect=lambda: self._notify_ws_reconnect("장운영"))
         ws_jif.on(JIF_TR_CD, self._on_jif)
         ws_jif.subscribe(JIF_TR_CD, JIF_TR_KEY)
         wss.append(ws_jif)
 
         if self._account:
             ws_exec = LSWebSocket(self._settings, token_mgr, name="체결",   # 체결통보 — 계좌등록(1)
-                                  on_disconnect=lambda: self._notify_ws_disconnect("체결"))
+                                  on_disconnect=lambda: self._notify_ws_disconnect("체결"),
+                                  on_reconnect=lambda: self._notify_ws_reconnect("체결"))
             ws_exec.on(C01_EXEC_NOTICE, self._on_c01)
             ws_exec.on(O01_ACCEPT_NOTICE, self._on_account_event)   # 접수 → 변동 알림
             ws_exec.on(H01_MODIFY_NOTICE, self._on_account_event)   # 정정취소 → 변동 알림

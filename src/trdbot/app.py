@@ -18,7 +18,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from datetime import time as dtime
 
 from lsapi import LSClient
@@ -48,6 +48,9 @@ from trdbot.signal_link import Signal, SignalLink
 from trdbot.targets import target_contracts
 
 logger = logging.getLogger(__name__)
+
+# 장중 WS 끊김 상태 알람 유예(초) — 이 안에 복구되면 로그만(LS 서버 끊김은 보통 수 초 내 복구).
+_CONN_GRACE_SEC = 30.0
 
 
 def _now_hhmm() -> int:
@@ -115,9 +118,14 @@ class TradingApp:
             env=_settings.ls_env,               # 캡션에 모의/운영 표시
             signal_token=self._signal_token,    # 캡션·로그줄에 발신처 구분 표시
         )
-        # 리스크 알람: {키: 사유}. 사용자가 해제할 때까지 1분마다 경고음(_alarm_tick).
+        # 알람은 두 종류. 둘 다 이 dict에 올라가고 활성 중엔 1분마다 경고음(_alarm_tick).
+        #  - 리스크 알람(브레이커·최대잔고·증거금): 사람이 조치해야 함 → 사용자 해제까지 유지.
+        #  - 상태 알람(키 'ws:*', WS 연결): 스스로 복구됨 → 복구되면 자동 해제. 장 닫힌 시간엔
+        #    알람 없음, 장중엔 _CONN_GRACE_SEC 넘게 안 붙을 때만(LS는 매일 06:10 WS를 끊는다).
         self._alarms: dict[str, str] = {}
         self._alarm_lock = threading.Lock()
+        self._conn_down: dict[str, float] = {}   # 끊긴 연결명 → 끊긴 시각(monotonic)
+        self._conn_acked: set[str] = set()       # 사용자가 해제한 끊김(복구 전엔 다시 안 울림)
         self._trade_enabled = False   # '주문' 체크박스 상태(False=관찰모드, 주문 안 나감)
         self.client: LSClient | None = None
         self.broker: SessionRoutingBroker | None = None
@@ -247,6 +255,7 @@ class TradingApp:
         try:
             self._ensure_daily_token()   # 주간장 개시 시 토큰 선제 재발급(하루 1회)
             self._check_rollover_alert()  # 롤오버일 09:30·14:00 확인창
+            self._check_conn_alarms()     # 끊긴 WS — 장중 유예 초과 시 상태 알람
             self.screen.set_market_status(*self._market_status())
         except Exception:
             logger.debug("장운영 상태 갱신 실패", exc_info=True)
@@ -357,7 +366,8 @@ class TradingApp:
             on_accept=self._on_accept,         # O01 접수 → 미체결 즉시 추가
             on_cancel=self._on_cancel,         # H01 정정취소 → 미체결 즉시 제거
             on_notice=(self._monitor.notify if self._monitor is not None else None),
-            on_disconnect=self._on_ws_disconnect,     # 예기치 않은 WS 끊김 → 리스크 알람
+            on_disconnect=self._on_ws_disconnect,     # 예기치 않은 WS 끊김 → 상태 알람 후보
+            on_reconnect=self._on_ws_reconnect,       # 끊김 뒤 복구 → 상태 알람 해제
             token_manager=self._data_client.tokens,   # REST와 토큰 공유 → 재발급이 WS에도 반영
         )
         self._store.set_feed(self.rt)          # 포지션 C01 net·체결을 저장소에 연결
@@ -411,6 +421,13 @@ class TradingApp:
         # 데이터 클라이언트(_data_client)는 영속 — 모니터/저장소가 계속 쓰므로 여기서 안 닫음.
         ex, sig, rt = self.executor, self.signal, self.rt
         self.executor = self.signal = self.broker = self.rt = None
+        # 의도된 정지 → 끊김 기록·연결 상태 알람 정리(정지 중엔 재연결 콜백이 안 오므로)
+        with self._alarm_lock:
+            down = list(self._conn_down)
+            self._conn_down.clear()
+            self._conn_acked.clear()
+        for name in down:
+            self._clear_alarm(f"ws:{name}")
 
         def shutdown() -> None:
             try:
@@ -486,6 +503,8 @@ class TradingApp:
         with self._alarm_lock:
             had = bool(self._alarms)
             self._alarms.clear()
+            # 아직 끊긴 연결은 '확인함' 처리 — 복구 전까지 다시 울리지 않게(복구되면 리셋).
+            self._conn_acked = set(self._conn_down)
         self.screen.post(lambda: self.screen.show_alarm([]))
         if had:
             logger.info("리스크 알람 해제(사용자)")
@@ -519,9 +538,64 @@ class TradingApp:
         except Exception:
             logger.debug("경고음 실패", exc_info=True)
 
+    def _clear_alarm(self, key: str) -> None:
+        """알람 하나 해제(상태 알람 자동 해제용). 없으면 무시."""
+        with self._alarm_lock:
+            if self._alarms.pop(key, None) is None:
+                return
+            active = list(self._alarms.values())
+        self.screen.post(lambda: self.screen.show_alarm(active))
+        logger.info("알람 자동 해제: [%s]", key)
+
+    def _market_closed(self) -> bool:
+        """장 닫힌 시간인가 — 세션 밖(06:00~08:45, 15:45~18:00) 또는 주말·휴일.
+
+        야간(18:00~익일 06:00)은 그 세션이 시작한 날(자정 넘으면 전날)이 영업일인지로 본다.
+        """
+        from trdbot.expiry import is_trading_day
+        hhmm = _now_hhmm()
+        sess = session_now(hhmm)
+        if sess == "closed":
+            return True
+        day = datetime.now().date()
+        if sess == "night" and hhmm < 600:
+            day -= timedelta(days=1)
+        return not is_trading_day(day, self._holidays)
+
     def _on_ws_disconnect(self, name: str) -> None:
-        """실시간 WS(시세/장운영/체결) 예기치 않은 끊김 → 알람. (의도된 재연결은 제외돼 옴)"""
-        self._raise_alarm(f"ws:{name}", f"{name} 연결 끊김 — 재연결 시도 중")
+        """실시간 WS 예기치 않은 끊김(WS 스레드) — 바로 알람하지 않고 끊긴 시각만 기록.
+
+        알람 여부는 _check_conn_alarms(2초 주기)가 장 시간·유예로 판단. (의도된 재연결은 안 옴)
+        """
+        with self._alarm_lock:
+            self._conn_down.setdefault(name, time.monotonic())
+        logger.warning("%s 연결 끊김 — 재연결 시도 중(%s)", name,
+                       "장 닫힘: 알람 없음" if self._market_closed()
+                       else f"{_CONN_GRACE_SEC:.0f}초 안에 복구 안 되면 알람")
+
+    def _on_ws_reconnect(self, name: str) -> None:
+        """끊겼던 WS 복구(WS 스레드) → 끊김 기록 삭제 + 상태 알람 자동 해제."""
+        with self._alarm_lock:
+            since = self._conn_down.pop(name, None)
+            self._conn_acked.discard(name)
+        if since is not None:
+            logger.info("%s 연결 복구 (끊김 %.0f초)", name, time.monotonic() - since)
+        self._clear_alarm(f"ws:{name}")
+
+    def _check_conn_alarms(self) -> None:
+        """끊긴 채인 연결 → 장중이고 유예를 넘겼으면 상태 알람(메인스레드 2초 주기).
+
+        장 닫힌 시간엔 알람 없음. 닫힌 시간에 끊겨 개장까지 못 붙었으면 개장 직후 여기서 울린다.
+        """
+        if self._market_closed():
+            return
+        now = time.monotonic()
+        with self._alarm_lock:
+            due = [n for n, t in self._conn_down.items()
+                   if now - t >= _CONN_GRACE_SEC and n not in self._conn_acked
+                   and f"ws:{n}" not in self._alarms]
+        for name in due:
+            self._raise_alarm(f"ws:{name}", f"{name} 연결 끊김 — 재연결 시도 중")
 
     def _on_accept(self, rec: dict) -> None:
         """O01 접수 시(WS 스레드) → 미체결 목록에 즉시 추가(조회 없이). 실시간 미체결."""
