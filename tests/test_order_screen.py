@@ -8,7 +8,8 @@ from trdbot.order_screen import LIVE_KEYS, build_config, parse_live_params
 def _raw(**kw):
     base = {
         "account_dollar_ratio": "10", "hedge_ratio": "10", "usd_futures_held": "0",
-        "qty_per_order": "3", "order_interval_sec": "10", "max_position": "100",
+        "qty_per_order": "3", "order_interval_sec": "10", "fill_interval_sec": "2",
+        "max_position": "100",
     }
     base.update(kw)
     return base
@@ -53,8 +54,26 @@ def test_qty_0이면_오류():
         parse_live_params(_raw(qty_per_order="0"))
 
 
-def test_LIVE_KEYS_7개():
-    assert len(LIVE_KEYS) == 7
+def test_체결주문인터벌_파싱_0허용():
+    assert parse_live_params(_raw())["fill_interval_sec"] == 2.0
+    assert parse_live_params(_raw(fill_interval_sec="0"))["fill_interval_sec"] == 0.0   # 0=체결 후 즉시
+
+
+@pytest.mark.parametrize("bad", ["", "-1", "abc"])
+def test_체결주문인터벌_잘못된값이면_오류(bad):
+    with pytest.raises(ValueError, match="체결주문인터벌"):
+        parse_live_params(_raw(fill_interval_sec=bad))
+    with pytest.raises(ValueError, match="체결주문인터벌"):
+        build_config(_cfg_raw(fill_interval_sec=bad))
+
+
+def test_체결주문인터벌_config로_전달():
+    assert build_config(_cfg_raw(fill_interval_sec="5")).fill_interval_sec == 5.0
+
+
+def test_LIVE_KEYS_8개():
+    assert len(LIVE_KEYS) == 8
+    assert "fill_interval_sec" in LIVE_KEYS
     assert "usd_futures_held" in LIVE_KEYS
     assert "fill_limit" in LIVE_KEYS and "fill_window_min" in LIVE_KEYS
     assert "code" not in LIVE_KEYS                    # 종목코드는 실행 중 잠금
@@ -77,7 +96,7 @@ def test_체결량한도_파싱():
 def _cfg_raw(**kw):
     base = {
         "code": "A756A000", "qty_per_order": "2", "order_interval_sec": "10",
-        "max_position": "50", "hedge_ratio": "0", "usd_futures_held": "0",
+        "fill_interval_sec": "0", "max_position": "50", "hedge_ratio": "0", "usd_futures_held": "0",
         "day_start": "8:45:00", "day_end": "15:35:00",
         "night_start": "18:05:00", "night_end": "05:00:00",
     }

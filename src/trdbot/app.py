@@ -378,6 +378,7 @@ class TradingApp:
             self.broker,
             qty_per_order=cfg.qty_per_order,
             order_interval_sec=cfg.order_interval_sec,
+            fill_interval_sec=cfg.fill_interval_sec,
             max_position=cfg.max_position,
             compute_target=self._compute_target,
             fallback_tick=USD_FUTURES_TICK,
@@ -449,14 +450,17 @@ class TradingApp:
         """C01 체결 시(WS 스레드) → 미체결 목록에 **즉시 반영**(조회 없이) + 집행 깨우기.
 
         체결된 주문을 미체결 캐시에서 바로 빼므로(전량체결 시 제거), t0434를 안 기다리고
-        다음 주문이 즉시 나간다 — 진짜 실시간. (드리프트는 주기 t0434 재동기화로 보정)
+        바로 재맞춤한다. 다음 주문은 체결주문인터벌이 지나야 나간다(0이면 즉시).
+        (드리프트는 주기 t0434 재동기화로 보정)
         """
+        ex = self.executor
+        if ex is not None:
+            ex.note_fill()   # 장부에서 빼기 전에 기록 — 인터벌 없이 주문이 나가는 틈 방지
         if self._store is not None:
             self._store.apply_fill(ordno, qty)   # C01 체결을 미체결에 즉시 차감/제거
         self._beep_fill()                         # 체결음(사운드 체크 시)
-        ex = self.executor
         if ex is not None:
-            ex.wake()   # 체결 즉시 재맞춤 → 다음 주문 바로 나감
+            ex.wake()   # 체결 즉시 재맞춤 → 체결주문인터벌 지나면 다음 주문
         # 체결 = 잔고 변동 → 포지션도 갱신. 장 종료·정지(관찰) 상태로 reconcile이 안 돌 때도
         # 잔고가 반영되게 별도 재조회(in_window 게이트와 무관). 연타 체결은 스로틀로 accno 절감.
         self._refresh_position_after_fill()
@@ -661,6 +665,7 @@ class TradingApp:
         if ex is not None:
             ex.qty_per_order = live["qty_per_order"]
             ex.order_interval_sec = live["order_interval_sec"]
+            ex.fill_interval_sec = live["fill_interval_sec"]
             ex.max_position = live["max_position"]
             ex.wake()  # 다음 사이클 기다리지 말고 즉시 다시 맞춰가기
         # 화면 목표계약수도 즉시 재계산(마지막 시그널 + 새로 적용된 값) → 표시와 집행 일치

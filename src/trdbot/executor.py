@@ -181,6 +181,7 @@ class ReconcileResult:
     kept_open: int = 0           # 유지 중인 미체결 주문 수(있으면 인터벌마다 계속 관리)
     order_no: str | None = None  # 새로 낸 주문번호
     rejected: bool = False       # 주문거부 발생(run이 백오프 재시도 판단)
+    retry_after: float = 0.0     # 체결주문인터벌 남은 시간(초) — run이 이만큼 대기 후 재시도
 
 
 class Executor:
@@ -198,6 +199,7 @@ class Executor:
         fill_breaker: Callable[[], bool] = lambda: False,  # True면 체결량 한도 초과 → 주문 중지
         on_breaker_trip: Callable[[], None] | None = None,  # 트립 시(앱이 '주문' 해제)
         test_nofill_ticks: int = 0,   # (테스트) 비체결 방향 N틱 이동: 매수↓ 매도↑ (0=정상)
+        fill_interval_sec: float = 0.0,   # 체결주문인터벌: 마지막 체결 후 이 시간 동안 새 주문 보류(0=끔)
         fallback_tick: float | None = None,         # 호가 성길 때 틱 폴백(예: KOSPI200 0.05)
         on_status: Callable[[str], None] | None = None,
         on_position: Callable[[int], None] | None = None,  # 포지션 읽을 때마다 보고(화면 표시용)
@@ -212,6 +214,7 @@ class Executor:
         self.broker = broker
         self.qty_per_order = qty_per_order
         self.order_interval_sec = order_interval_sec
+        self.fill_interval_sec = fill_interval_sec
         self.max_position = max_position
         self.max_orders = max_orders
         self.compute_target = compute_target
@@ -245,6 +248,21 @@ class Executor:
         self._placed_at: dict[str, float] = {}   # 우리가 낸 주문번호 → 시각(인터벌 게이트용)
         self._canceling: set[str] = set()   # 취소 요청 후 확인(사라짐) 대기 중인 주문(정규화)
         self._reject_streak = 0   # 연속 주문거부 횟수(백오프 증가용) — 성공 시 0으로 리셋
+        self._last_fill_at: float | None = None   # 마지막 체결 시각(체결주문인터벌 기준)
+
+    # ---- 체결 통보 입력 ----
+    def note_fill(self) -> None:
+        """체결 시각 기록. ⚠️ 미체결 장부에서 빼기(apply_fill) **전에** 불러야 한다.
+
+        반대 순서면 '미체결 0 + 기록 없음'을 집행 스레드가 먼저 보고 인터벌 없이 주문할 수 있다.
+        """
+        self._last_fill_at = self._clock()
+
+    def _fill_gate_remaining(self) -> float:
+        """체결주문인터벌 남은 시간(초). 체결 기록이 없거나 끔(0)이거나 지났으면 0."""
+        if self._last_fill_at is None or self.fill_interval_sec <= 0:
+            return 0.0
+        return max(0.0, self._last_fill_at + self.fill_interval_sec - self._clock())
 
     # ---- 시그널 입력 (signal_link.on_signal에 연결) ----
     def on_signal(self, sig: object) -> None:
@@ -363,6 +381,13 @@ class Executor:
             in_window=True, max_orders=self.max_orders,
         )
         dec = plan.decision
+        # 체결주문인터벌: 낼 주문이 있어도 마지막 체결 후 이 시간이 지나야 낸다(경고 아닌 정상 대기).
+        fill_wait = self._fill_gate_remaining() if dec.action == "order" else 0.0
+        if fill_wait > 0:
+            dec = Decision("skip", "체결주문인터벌 대기")
+            self._log_quote(buy_q, sell_q, buy_price, sell_price, target, position, dec)
+            self._log_change("state", f"{dec.reason} (목표 {target}, 포지션 {position})")
+            return ReconcileResult(dec, kept_open=0, retry_after=fill_wait)
         self._log_quote(buy_q, sell_q, buy_price, sell_price, target, position, dec)
         order_no = None
         if dec.action == "order":
@@ -441,6 +466,12 @@ class Executor:
                 self._backoff_wait(wait)
                 continue
             self._reject_streak = 0   # 거부 없는 사이클 → 스트릭 리셋
+            # 체결주문인터벌 대기 → 남은 시간만큼 쉬고 재시도(시그널로 깨도 게이트가 다시 막음).
+            if r.retry_after > 0:
+                self._converged = False
+                self._wake.wait(r.retry_after)
+                self._wake.clear()
+                continue
             # 주문을 냈거나 유지 중인 미체결이 남아 있으면 → 인터벌 뒤 다시 맞춰간다.
             # (그 사이 체결되면 포지션이 실시간 반영, 호가가 움직이면 낡은 주문 취소·재호가)
             if r.decision.action == "order" or r.kept_open > 0:

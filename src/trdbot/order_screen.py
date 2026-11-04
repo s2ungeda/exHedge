@@ -52,7 +52,7 @@ class OrderConfig:
 
     code: str
     qty_per_order: int          # 1회주문계약수
-    order_interval_sec: float   # 주문 인터벌(s) — N초마다 재평가, 호가 바뀌면 취소·재호가
+    order_interval_sec: float   # 재주문인터벌(s) — N초마다 재평가, 호가 바뀌면 취소·재호가
     max_position: int           # 최대잔고한도(계약)
     hedge_ratio: float           # 헤지비율 B(%)
     day_window: TimeWindow      # 주간 주문가능시간
@@ -60,6 +60,7 @@ class OrderConfig:
     fill_window_min: float = 10.0  # 체결량 감시 시간(분)
     fill_limit: int = 0            # 이 시간 내 누적 체결량 한도(개). 0=기능 끔
     usd_futures_held: int = 0      # 보유 원달러(계약수 ±) → C(달러노출선물계약수) 그대로
+    fill_interval_sec: float = 0.0  # 체결주문인터벌(s) — 마지막 체결 후 새 주문까지 대기(0=즉시)
     extra: dict = field(default_factory=dict)
 
 
@@ -114,7 +115,7 @@ def _held(raw: dict[str, str]) -> int:
 def build_config(raw: dict[str, str]) -> OrderConfig:
     """화면 입력(str dict) → 검증된 OrderConfig. 오류 시 ValueError.
 
-    raw 키: code, qty_per_order, order_interval_sec, max_position,
+    raw 키: code, qty_per_order, order_interval_sec, fill_interval_sec, max_position,
             hedge_ratio, day_start, day_end, night_start, night_end
     (환율은 입력이 아니라 시그널이 주는 조회값 → 여기서 다루지 않음)
     """
@@ -123,7 +124,8 @@ def build_config(raw: dict[str, str]) -> OrderConfig:
         raise ValueError("종목코드: 비어 있습니다.")
 
     qty = _num("1회주문계약수", raw.get("qty_per_order", ""), cast=int, minv=2)
-    interval = _num("주문 인터벌(s)", raw.get("order_interval_sec", ""), cast=float, minv=0, allow_zero=False)
+    interval = _num("재주문인터벌(s)", raw.get("order_interval_sec", ""), cast=float, minv=0, allow_zero=False)
+    fill_interval = _fill_interval(raw)
     maxpos = _num("최대잔고한도", raw.get("max_position", ""), cast=int, minv=1)
     b = _num("헤지비율(B)", raw.get("hedge_ratio", ""), cast=float, minv=0)
     held = _held(raw)
@@ -140,7 +142,13 @@ def build_config(raw: dict[str, str]) -> OrderConfig:
         hedge_ratio=b,
         day_window=day, night_window=night,
         fill_window_min=fwin, fill_limit=flim, usd_futures_held=held,
+        fill_interval_sec=fill_interval,
     )
+
+
+def _fill_interval(raw: dict[str, str]) -> float:
+    """체결주문인터벌(초). 0은 '체결 후 즉시 주문'. 빈칸을 0으로 삼키면 대기 없이 주문이 나가므로 오류."""
+    return _num("체결주문인터벌(s)", raw.get("fill_interval_sec", ""), cast=float, minv=0)
 
 
 def _fill_params(raw: dict[str, str]) -> tuple[float, int]:
@@ -156,29 +164,31 @@ def _fill_params(raw: dict[str, str]) -> tuple[float, int]:
 # 종목코드·시간창은 실행(Ready) 중 잠금.
 LIVE_KEYS = (
     "hedge_ratio", "usd_futures_held",
-    "qty_per_order", "order_interval_sec", "max_position",
+    "qty_per_order", "order_interval_sec", "fill_interval_sec", "max_position",
     "fill_window_min", "fill_limit",
 )
 
 
 def parse_live_params(raw: dict[str, str]) -> dict:
-    """실행 중 변경 가능한 7개 항목을 검증해 dict로 반환. 오류 시 ValueError.
+    """실행 중 변경 가능한 8개 항목을 검증해 dict로 반환. 오류 시 ValueError.
 
-    B(헤지비율)·보유 원달러(±계약수) + 1회주문계약수·주문인터벌·최대잔고한도
+    B(헤지비율)·보유 원달러(±계약수) + 1회주문계약수·재주문인터벌·체결주문인터벌·최대잔고한도
     + 체결감시시간(분)·체결량한도(개).
     """
     b = _num("헤지비율(B)", raw.get("hedge_ratio", ""), cast=float, minv=0)
     held = _held(raw)
     qty = _num("1회주문계약수", raw.get("qty_per_order", ""), cast=int, minv=2)
-    interval = _num("주문 인터벌(s)", raw.get("order_interval_sec", ""), cast=float,
+    interval = _num("재주문인터벌(s)", raw.get("order_interval_sec", ""), cast=float,
                     minv=0, allow_zero=False)
+    fill_interval = _fill_interval(raw)
     maxpos = _num("최대잔고한도", raw.get("max_position", ""), cast=int, minv=1)
     fwin, flim = _fill_params(raw)
     if qty > maxpos:
         raise ValueError(f"1회주문계약수({qty})가 최대잔고한도({maxpos})보다 큽니다.")
     return {
         "hedge_ratio": b, "usd_futures_held": held,
-        "qty_per_order": qty, "order_interval_sec": interval, "max_position": maxpos,
+        "qty_per_order": qty, "order_interval_sec": interval,
+        "fill_interval_sec": fill_interval, "max_position": maxpos,
         "fill_window_min": fwin, "fill_limit": flim,
     }
 
@@ -505,8 +515,10 @@ class OrderScreen:
         w = 5   # 1회주문계약수~체결량한도: 3자리면 충분 → 입력칸 좁게
         self._lab(c, "1회주문계약수").grid(row=0, column=0, sticky="w", pady=1, padx=(0, 6))
         self._entry(c, "qty_per_order", "3", width=w).grid(row=0, column=1, sticky="w", pady=1)
-        self._lab(c, "주문 인터벌(s)").grid(row=0, column=2, sticky="e", pady=1, padx=(14, 6))
+        self._lab(c, "재주문인터벌(s)").grid(row=0, column=2, sticky="e", pady=1, padx=(14, 6))
         self._entry(c, "order_interval_sec", width=w).grid(row=0, column=3, sticky="w", pady=1)
+        self._lab(c, "체결주문인터벌(s)").grid(row=0, column=4, sticky="e", pady=1, padx=(14, 6))
+        self._entry(c, "fill_interval_sec", "0", width=w).grid(row=0, column=5, sticky="w", pady=1)
 
         # 최대잔고한도 + 체결감시(분) + 체결량한도를 한 행에 — 세로 한 칸 절약.
         # 체결량 서킷 브레이커: 최근 N분 누적 체결이 한도 이상이면 미체결 취소+주문 중지(0=끔).

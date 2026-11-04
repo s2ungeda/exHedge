@@ -4,6 +4,10 @@
 이어지는지(취소 목록 → cancel, 새 주문 → place_order)를 본다.
 """
 
+import time
+from types import SimpleNamespace
+
+from trdbot.app import TradingApp
 from trdbot.executor import Executor, recent_fill_qty
 
 
@@ -130,6 +134,111 @@ def test_통보두절이면_첫주문만_나가고_멈춤():
         clk["t"] += 2.0                   # 인터벌 계속 지나도
         ex.reconcile()                    # 통보 없어 미체결 그대로 → 새 주문 안 나감
     assert len(broker.placed) == 1        # 첫 주문 1건뿐 — 폭주 없음
+
+
+def _exec_fill(broker, clk, fill_interval):
+    return Executor(
+        broker, qty_per_order=3, order_interval_sec=1.0, fill_interval_sec=fill_interval,
+        max_position=100, compute_target=lambda s: s, in_window=lambda: True,
+        fallback_tick=0.1, clock=lambda: clk["t"],
+    )
+
+
+def test_체결주문인터벌_지나기전엔_주문보류_지나면_주문():
+    clk = {"t": 100.0}
+    broker = FakeExecBroker(position=3)
+    ex = _exec_fill(broker, clk, fill_interval=5.0)
+    ex.on_signal(9)
+    ex.note_fill()                        # t=100 체결
+    clk["t"] = 102.0
+    r = ex.reconcile()
+    assert broker.placed == []            # 인터벌 안 → 보류
+    assert r.decision.action == "skip"
+    assert r.retry_after == 3.0           # 남은 시간만큼 run이 대기
+    clk["t"] = 105.0
+    r = ex.reconcile()
+    assert len(broker.placed) == 1        # 인터벌 경과 → 주문
+    assert r.retry_after == 0.0
+
+
+def test_체결주문인터벌_0이면_체결직후_바로주문():
+    clk = {"t": 100.0}
+    broker = FakeExecBroker(position=3)
+    ex = _exec_fill(broker, clk, fill_interval=0.0)
+    ex.on_signal(9)
+    ex.note_fill()
+    ex.reconcile()
+    assert len(broker.placed) == 1
+
+
+def test_체결주문인터벌_체결이력_없으면_첫주문은_바로():
+    clk = {"t": 100.0}
+    broker = FakeExecBroker(position=0)
+    ex = _exec_fill(broker, clk, fill_interval=5.0)
+    ex.on_signal(6)
+    ex.reconcile()
+    assert len(broker.placed) == 1
+
+
+def test_체결주문인터벌_수렴이면_대기없이_stop():
+    clk = {"t": 100.0}
+    broker = FakeExecBroker(position=6)
+    ex = _exec_fill(broker, clk, fill_interval=5.0)
+    ex.on_signal(6)
+    ex.note_fill()
+    r = ex.reconcile()
+    assert r.decision.action == "stop"    # 낼 주문이 없으면 게이트 무관 → idle로 전환
+    assert r.retry_after == 0.0
+
+
+def test_체결주문인터벌_중에도_반대방향_미체결은_즉시취소():
+    clk = {"t": 100.0}
+    broker = FakeExecBroker(
+        position=0,
+        open_orders=[{"ordno": "111", "side": "sell", "remaining": 3, "price": 1380.2}],
+    )
+    ex = _exec_fill(broker, clk, fill_interval=5.0)
+    ex.on_signal(6)
+    ex.note_fill()
+    ex.reconcile()
+    assert broker.cancelled == ["111"]    # 취소는 게이트 대상이 아님
+
+
+def test_체결주문인터벌_run루프_시그널로_깨워도_인터벌전엔_주문없음():
+    broker = PendingBroker(position=3)
+    ex = Executor(
+        broker, qty_per_order=3, order_interval_sec=10.0, fill_interval_sec=0.5,
+        max_position=100, compute_target=lambda s: s, in_window=lambda: True, fallback_tick=0.1,
+    )
+    ex.on_signal(9)
+    ex.note_fill()
+    ex.start()
+    try:
+        for _ in range(3):
+            time.sleep(0.05)
+            ex.on_signal(9)               # 시그널이 대기를 깨워도
+            ex.wake()
+        assert broker.placed == []        # 게이트가 다시 막음
+        deadline = time.monotonic() + 3.0
+        while not broker.placed and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert len(broker.placed) == 1    # 인터벌 뒤 1건
+    finally:
+        ex.stop()
+
+
+def test_앱_체결처리는_장부에서_빼기전에_체결시각_기록():
+    # 순서가 바뀌면 '미체결 0 + 기록 없음'을 집행 스레드가 먼저 보고 인터벌 없이 주문할 수 있다.
+    calls = []
+    app = SimpleNamespace(
+        _store=SimpleNamespace(apply_fill=lambda o, q: calls.append("apply_fill")),
+        executor=SimpleNamespace(note_fill=lambda: calls.append("note_fill"),
+                                 wake=lambda: calls.append("wake")),
+        _beep_fill=lambda: None,
+        _refresh_position_after_fill=lambda: None,
+    )
+    TradingApp._on_fill(app, "111", 3)
+    assert calls == ["note_fill", "apply_fill", "wake"]
 
 
 def test_같은방향_제가격이면_유지하고_새주문은안함():
