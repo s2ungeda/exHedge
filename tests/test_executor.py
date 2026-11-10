@@ -241,6 +241,27 @@ def test_앱_체결처리는_장부에서_빼기전에_체결시각_기록():
     assert calls == ["note_fill", "apply_fill", "wake"]
 
 
+def test_상태읽는중_주문꺼지면_그사이클엔_주문안냄():
+    # 세션 전환 잔고 불일치 → 앱이 상태 읽기(get_snapshot) 도중 '주문'을 끈다 → 이번 사이클 주문 금지.
+    state = {"on": True}
+
+    class SnapBroker(FakeExecBroker):
+        def get_snapshot(self):
+            state["on"] = False
+            return self._position, list(self._open)
+
+    broker = SnapBroker(position=0)
+    ex = Executor(
+        broker, qty_per_order=3, order_interval_sec=1.0, max_position=100,
+        compute_target=lambda s: s, in_window=lambda: True, fallback_tick=0.1,
+        trade_enabled=lambda: state["on"],
+    )
+    ex.on_signal(6)
+    r = ex.reconcile()
+    assert broker.placed == []
+    assert r.decision.action == "stop"
+
+
 def test_같은방향_제가격이면_유지하고_새주문은안함():
     # 동시 1개(기본): 들고 온 매수 유지하고 새 주문은 안 냄(체결 기다림)
     broker = FakeExecBroker(

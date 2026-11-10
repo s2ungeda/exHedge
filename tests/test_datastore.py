@@ -65,6 +65,105 @@ def test_포지션_시작값_더하기_C01증감_폴링없음():
     assert api.balance_calls == 1          # 그동안 t0441 폴링 안 함
 
 
+def test_재실행으로_피드가_바뀌면_잔고를_다시_앵커():
+    # 시동: 잔고 10 앵커(피드 없음) → Ready: 피드1에서 +6 체결 → 정지 → Ready: 새 피드(누적 0).
+    # 시작값을 그대로 쓰면 10으로 보여 체결 6이 빠진다 → 피드 교체 시 잔고(16)로 다시 앵커해야 함.
+    api = FakeApi(bal=_bal(10))
+    s = MarketDataStore(api, code_prefix="A756", clock=lambda: 0.0)
+    s.refresh()                            # 시동 시 모니터 초기 조회
+    feed1 = FakeFeed(net=0)
+    s.set_feed(feed1)
+    assert s.net_position() == 10
+    feed1._net = 6
+    assert s.net_position() == 16          # 실행 중 체결 반영
+    api._bal = _bal(16)                    # 실제 잔고도 16
+    s.set_feed(FakeFeed(net=0))            # 재실행 — 새 피드는 0부터
+    assert s.net_position() == 16          # 10으로 돌아가면 안 됨
+
+
+class FakeNightApi:
+    def __init__(self, rows):
+        self._rows = rows
+        self.calls = 0
+
+    def get_balance(self):
+        self.calls += 1
+        return {"CCENQ90200OutBlock3": self._rows}
+
+
+def _night_rows(qty, side="매수"):
+    return [{"FnoIsuNo": "A7567000", "UnsttQty": qty, "BnsTpNm": side}]
+
+
+def _sess_store(day_qty, night_qty):
+    sess = {"s": "day"}
+    api, napi = FakeApi(bal=_bal(day_qty)), FakeNightApi(_night_rows(night_qty))
+    feed = FakeFeed(net=0)
+    s = MarketDataStore(api, code_prefix="A756", feed=feed, clock=lambda: 0.0,
+                        night_api=napi, session=lambda: sess["s"])
+    seen = []
+    s.on_session_mismatch = lambda kind, prev, net: seen.append((kind, prev, net))
+    return s, sess, feed, api, napi, seen
+
+
+def test_주간에서_야간_넘어가면_야간잔고로_다시_앵커():
+    s, sess, feed, api, napi, seen = _sess_store(day_qty=10, night_qty=13)
+    assert s.net_position() == 10          # 주간 t0441
+    feed._net = 3
+    assert s.net_position() == 13          # 주간 체결 +3
+    sess["s"] = "closed"
+    assert s.net_position() == 13          # 장 사이: 같은 t0441 기준 → 재조회 없음
+    assert api.balance_calls == 1
+    sess["s"] = "night"
+    assert s.net_position() == 13          # 야간잔고 13으로 다시 앵커
+    assert napi.calls == 1
+    assert seen == []                      # 일치 → 알림 없음
+    feed._net = 5
+    assert s.net_position() == 15          # 이후 야간 체결(C02)만 더함
+    assert napi.calls == 1                 # 야간 중엔 다시 조회 안 함
+
+
+def test_야간에서_주간_넘어가도_다시_앵커():
+    s, sess, feed, api, napi, seen = _sess_store(day_qty=7, night_qty=7)
+    sess["s"] = "night"
+    assert s.net_position() == 7
+    sess["s"] = "day"
+    assert s.net_position() == 7
+    assert api.balance_calls == 1 and napi.calls == 1
+    assert seen == []
+
+
+def test_장사이_closed면_직전기준_유지_다음장_열릴때만_전환():
+    # 야간 끝(06:00) → closed: 아직 주간장 안 열림 → t0441 부르지 않고 야간 기준 유지.
+    s, sess, feed, api, napi, seen = _sess_store(day_qty=7, night_qty=7)
+    sess["s"] = "night"
+    assert s.net_position() == 7
+    sess["s"] = "closed"
+    assert s.net_position() == 7
+    assert api.balance_calls == 0 and napi.calls == 1   # 전환 없음
+    sess["s"] = "day"                                    # 주간장이 실제로 열림
+    assert s.net_position() == 7
+    assert api.balance_calls == 1
+
+
+def test_세션전환_잔고가_다르면_알림_새잔고사용():
+    s, sess, feed, api, napi, seen = _sess_store(day_qty=10, night_qty=4)
+    assert s.net_position() == 10
+    sess["s"] = "night"
+    assert s.net_position() == 4           # 잔고가 진실 → 새 값
+    assert seen == [("night", 10, 4)]      # 앱이 알람 + 주문 중지
+
+
+def test_같은_피드_재연결이면_다시_앵커_안함():
+    api = FakeApi(bal=_bal(4))
+    feed = FakeFeed(net=0)
+    s = MarketDataStore(api, code_prefix="A756", feed=feed, clock=lambda: 0.0)
+    s.net_position()
+    s.set_feed(feed)
+    s.net_position()
+    assert api.balance_calls == 1
+
+
 def test_포지션_주기경과해도_자동재동기화안함():
     # 자동 t0441 재조회는 끔(체결 직후 stale 조회가 실포지션 덮어써 오버슛 유발) → C01만으로 추적.
     api = FakeApi(bal=_bal(5))

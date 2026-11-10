@@ -20,7 +20,15 @@ maker 재호가 전략은 **접속매매(연속) 구간에서만 안전**하다:
 
 from __future__ import annotations
 
+from datetime import date
 from enum import Enum
+
+from lsapi.session_hours import (
+    CLOSE_AUCTION_MIN,
+    hours_for,
+    minus_minutes,
+    night_close_today,
+)
 
 # JIF 실시간 구독 파라미터 (공식 예제 기준).
 JIF_TR_CD = "JIF"
@@ -88,36 +96,35 @@ def phase_badge(phase: Phase) -> tuple[str, str]:
     return PHASE_BADGE.get(phase, ("확인중", "#9FB3C8"))
 
 
-# KRX 미국달러선물 주간 거래시간 (JIF 실측 확인: 08:45:00 jangubun=5 jstatus=21=접속매매):
-#   장개시 동시호가 ~08:45 / 접속매매 08:45~15:35 / 장마감 동시호가 15:35~15:45.
-# JIF 미수신 시 폴백 판단에만 쓰는 근사치 — JIF 이벤트가 오면 그 진실이 우선한다.
-# (session_now의 주간 08:45 시작과 일치시킴 — 예전엔 09:00으로 잡혀 08:45~09:00을 오판했음)
-DAY_OPEN_AUCTION_END = 845      # 08:45 접속매매 시작 (이 전은 장개시 동시호가)
-DAY_CLOSE_AUCTION_START = 1535  # 15:35 장마감 동시호가 시작 (이 후는 단일가)
-
-# KRX 야간파생(글로벌 거래) 시각 (거래소 공식 안내 open.krx.co.kr, FICC 미국달러선물 포함):
-#   시가단일가 호가접수 17:50~18:00 / 접속거래 18:00~05:50 / 종가단일가 호가접수 05:50~06:00.
-#   시가단일가(17:50~18:00)는 session_now가 'closed'로 이미 차단 → 여기선 종가단일가만 처리.
-NIGHT_CLOSE_AUCTION_START = 550  # 05:50 종가단일가 호가접수 시작 (이 후 ~06:00은 단일가)
+# 시각 폴백(JIF 미수신)의 거래시간은 lsapi.session_hours가 갖는다 — 평소 시간 + 특별일 시간표.
+#   평소 주간: 장개시 동시호가 ~08:45 / 접속매매 08:45~15:35 / 장마감 동시호가 15:35~15:45
+#     (JIF 실측: 08:45:00 jangubun=5 jstatus=21=접속매매)
+#   평소 야간: 시가단일가 17:50~18:00(session_now가 'closed'로 차단) / 접속거래 18:00~05:50 /
+#     종가단일가 05:50~06:00 (거래소 공식 안내 open.krx.co.kr)
+#   마감 단일가는 '마감 10분 전~마감'(CLOSE_AUCTION_MIN)으로 본다.
 
 
-def current_time_phase(now_hhmm: int, session: str) -> Phase:
+def current_time_phase(now_hhmm: int, session: str, today: date | None = None) -> Phase:
     """JIF 미수신 시 폴백용 — 현재 시각만으로 추정한 국면.
 
     session: session_now() 결과("day"/"night"/"closed").
-    주간 동시호가(장개시 ~09:00 / 장마감 15:35~), 야간 종가단일가(05:50~06:00)는
+    주간 동시호가(장개시 전 / 장마감 10분 전~), 야간 종가단일가(마감 10분 전~)는
     AUCTION으로 보아 신규 주문을 막는다. JIF 이벤트가 오면 그 진실이 우선한다.
+    시각은 그날 시간표(평소 08:45/15:45/06:00, 특별일은 config/special_hours.txt)를 따른다.
     """
     if session == "closed":
         return Phase.CLOSED
+    today = today or date.today()
     if session == "day":
-        if now_hhmm < DAY_OPEN_AUCTION_END:        # 장개시 동시호가
+        h = hours_for(today)
+        if now_hhmm < h.day_open:                                          # 장개시 동시호가
             return Phase.AUCTION
-        if now_hhmm >= DAY_CLOSE_AUCTION_START:     # 장마감 동시호가
+        if now_hhmm >= minus_minutes(h.day_close, CLOSE_AUCTION_MIN):      # 장마감 동시호가
             return Phase.AUCTION
         return Phase.CONTINUOUS
-    # night: 접속거래 18:00~05:50, 종가단일가 05:50~06:00(=HHMM 550~559). 시가단일가는 'closed'.
-    if NIGHT_CLOSE_AUCTION_START <= now_hhmm < 600:
+    # night: 접속거래 ~마감 10분 전, 종가단일가 마감 10분 전~마감. 시가단일가는 'closed'.
+    close = night_close_today(today)
+    if now_hhmm < close and now_hhmm >= minus_minutes(close, CLOSE_AUCTION_MIN):
         return Phase.AUCTION
     return Phase.CONTINUOUS
 

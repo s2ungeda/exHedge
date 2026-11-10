@@ -120,7 +120,11 @@ if abs(new_pos) > abs(effective) and abs(new_pos) > max_position:
 
 **코드 상수 대응**
 - `session_now` (`futures.py`): 주간 `08:45~15:45` → day, 야간 `18:00~06:00` → night, 그 외 closed.
-- `current_time_phase` 폴백 상수 (`market_state.py`): `DAY_OPEN_AUCTION_END=845`(접속매매 시작), `DAY_CLOSE_AUCTION_START=1535`(마감 동시호가 시작), `NIGHT_CLOSE_AUCTION_START=550`(야간 종가단일가 시작).
+- `current_time_phase` 폴백 시각 (`session_hours.py`): 주간 개장 08:45, 마감 동시호가 = 마감 10분 전(평소 15:35), 야간 종가단일가 = 마감 10분 전(평소 05:50).
+- **특별일 시간표** (`config/special_hours.txt`, `session_hours.py`): 수능일처럼 거래소가 시간을 바꾸는 날은
+  `2026-11-19  09:45-15:45  19:00-06:00` 형식(날짜 / 주간 개장-마감 / 야간 개장-익일 마감)으로 미리 적어 둔다.
+  `session_now`·`current_time_phase`가 이 값을 따른다. 장운영(JIF)은 상태가 바뀔 때만 오고 조회가 안 되므로,
+  장중 재시작·재접속 직후엔 다음 전환까지 이 시각 판단에 의존한다 → 시간 변경일은 반드시 미리 넣을 것.
 
 > ✅ **정합성 반영됨(2026-08-04)**: 예전엔 폴백 `DAY_OPEN_AUCTION_END`가 **09:00**이라 `session_now`(08:45)와 어긋나 **JIF 미수신 시 08:45~09:00을 동시호가로 오판 → 주문 차단**되던 버그가 있었다. → **08:45로 맞춤**. (JIF 수신 중이면 실시간 국면이 우선)
 

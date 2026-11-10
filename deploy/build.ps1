@@ -70,6 +70,8 @@ if (-not (Test-Path "$dist\.env")) { Copy-Item "deploy\files\.env" "$dist\.env" 
 New-Item -ItemType Directory -Force "$dist\config" | Out-Null
 if (-not (Test-Path "$dist\config\holidays.txt")) { Copy-Item "config\holidays.txt" "$dist\config\holidays.txt" -Force }
 if (-not (Test-Path "$dist\config\fill.wav")) { Copy-Item "config\fill.wav" "$dist\config\fill.wav" -Force }
+# 특별일 거래시간(수능일 등) — 공지 반영본이라 항상 최신으로 갱신.
+Copy-Item "config\special_hours.txt" "$dist\config\special_hours.txt" -Force
 
 Write-Host "[압축] 배포 zip 생성..."
 # 운영 폴더에 그대로 풀어 덮어써도 안전하게: .env(계좌번호)는 빼고 빈 템플릿을 .env.template 로.

@@ -10,9 +10,11 @@ TR 코드/필드는 LS OpenAPI 공식 명세(openapi.ls-sec.co.kr) 확정값.
 """
 
 import logging
+from datetime import date
 from typing import Any, Literal
 
 from lsapi import endpoints as ep
+from lsapi.session_hours import hours_for, night_close_today
 from lsapi.client import LSClient
 from lsapi.exceptions import LSAPIError
 
@@ -295,16 +297,18 @@ class NightFuturesAPI:
         return self.c.call(e.path, e.tr_cd, body)
 
 
-def session_now(now_hhmm: int) -> Literal["day", "night", "closed"]:
+def session_now(now_hhmm: int, today: date | None = None) -> Literal["day", "night", "closed"]:
     """현재 한국시각 HHMM 정수로 미국달러선물 세션 판정(KRX 공식 거래시간).
 
-    주간 정규 08:45~15:45 → day
-    야간(글로벌)  18:00~익일 06:00 → night
-    그 외 → closed
-    (단일가 시간 포함 대략치. 정밀 운영시간/휴장은 장운영 TR로 보강 예정.)
+    평소: 주간 08:45~15:45 → day / 야간 18:00~익일 06:00 → night / 그 외 → closed.
+    거래소가 시간을 바꾸는 날(수능일 등)은 config/special_hours.txt 값을 따른다
+    (lsapi.session_hours). 새벽(야간 마감 전)은 **전날 시작한 야간장** 시간표로 판단.
+    장운영(JIF)을 받은 상태면 그게 우선이고, 이건 JIF 미수신 시 폴백이다.
     """
-    if 845 <= now_hhmm <= 1545:
+    today = today or date.today()
+    h = hours_for(today)
+    if h.day_open <= now_hhmm <= h.day_close:
         return "day"
-    if now_hhmm >= 1800 or now_hhmm < 600:
+    if now_hhmm >= h.night_open or now_hhmm < night_close_today(today):
         return "night"
     return "closed"

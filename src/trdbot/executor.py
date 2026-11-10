@@ -297,6 +297,9 @@ class Executor:
         trading = self.trade_enabled()
         if trading:
             position, open_orders = self._read_state()
+            # 상태 읽는 중에 주문이 꺼졌을 수 있다(세션 전환 잔고 불일치 → 앱이 '주문' 해제).
+            # 그 새 포지션으로 이번 사이클에 주문이 나가지 않게 다시 확인.
+            trading = self.trade_enabled()
         else:
             position = self.broker.get_position()
         if self.on_position:

@@ -58,6 +58,9 @@ class MarketDataStore:
         self._baseline: int | None = None  # 마지막 t0441 net(시작값)
         self._baseline_net = 0             # 그 시점의 C01 net
         self._baseline_at = 0.0
+        self._anchor_kind: str | None = None   # 시작값을 어느 잔고로 잡았나('day'=t0441 / 'night'=야간잔고)
+        # 세션 전환(주간↔야간) 재앵커 때 직전 추정과 잔고가 다르면 호출(kind, 직전추정, 잔고값).
+        self.on_session_mismatch: Callable[[str, int, int], None] | None = None
         # 미체결 캐시
         self._open_raw: list[dict] = []      # t0434 chegb=2 행(표시)
         self._open_at: float | None = None   # 마지막 t0434 시각(None=한 번도 안 가져옴)
@@ -77,16 +80,24 @@ class MarketDataStore:
         self._suppress_ttl = 5.0
 
     def set_feed(self, feed: Any) -> None:
-        """C01 net·체결 출처 RealtimeFeed 연결(봇 실행 시점에 주입)."""
-        self._feed = feed
+        """C01 net·체결 출처 RealtimeFeed 연결(봇 실행 시점에 주입).
+
+        피드를 바꾸면 시작값도 버리고 다음 조회 때 잔고로 다시 앵커한다. 새 피드의 C01 누적은
+        0부터 시작하므로, 이전 피드 기준 시작값(_baseline_net)을 그대로 쓰면 이전 실행 중 체결이
+        포지션에서 빠진다(정지 → Ready 재실행 시 체결분 누락 → 부족분으로 보고 추가 주문).
+        """
+        with self._lock:
+            if feed is not self._feed:
+                self._baseline = None
+            self._feed = feed
 
     # ── 포지션 ───────────────────────────────────────
     def _c01_net(self) -> int:
         return self._feed.c01_state()[1] if self._feed is not None else 0
 
-    def _fetch_position_rows(self) -> list[dict]:
+    def _fetch_position_rows(self, kind: str) -> list[dict]:
         # 야간: CCENQ90200(야간잔고)을 주간 형식(expcode/jqty/medosu)으로 정규화.
-        if self._session() == "night" and self._night_api is not None:
+        if kind == "night" and self._night_api is not None:
             rows = self._night_api.get_balance().get("CCENQ90200OutBlock3", [])
             out = []
             for r in rows:
@@ -101,9 +112,9 @@ class MarketDataStore:
             rows = [r for r in rows if str(r.get("expcode", "")).startswith(self._prefix)]
         return rows
 
-    def _read_balance_net(self) -> int:
-        """t0441 행 읽어 net 계산 + 표시용 행 캐시. 매수 +, 매도 −."""
-        rows = self._fetch_position_rows()
+    def _read_balance_net(self, kind: str | None = None) -> int:
+        """잔고(t0441/야간잔고) 행 읽어 net 계산 + 표시용 행 캐시. 매수 +, 매도 −."""
+        rows = self._fetch_position_rows(kind or self._balance_kind())
         total = 0
         for r in rows:
             qty = int(r.get("jqty", 0) or 0)
@@ -112,12 +123,25 @@ class MarketDataStore:
             self._positions = rows
         return total
 
-    def _anchor_positions(self) -> None:
-        """t0441로 시작값을 다시 잡는다(재동기화). 항상 진실에 맞추므로 안전.
+    def _balance_kind(self) -> str:
+        """지금 잔고를 어느 TR로 읽나 — 'night'=야간잔고 / 'day'=t0441.
+
+        session()이 'night'/'day'면 그대로. 'closed'(장 사이)면 **직전 기준을 유지**한다 —
+        다음 장이 실제로 열리기 전엔 그 장 잔고 TR을 부르지 않는다(개시 시각이 바뀌는 날 대비).
+        아직 기준이 없으면 t0441.
+        """
+        s = self._session()
+        if s in ("night", "day"):
+            return s
+        return self._anchor_kind or "day"
+
+    def _anchor_positions(self) -> tuple[int, int | None]:
+        """잔고(t0441/야간잔고)로 시작값을 다시 잡는다(재동기화). (잔고값, 앵커 직전 추정) 반환.
 
         네트워크(t0441)는 lock 밖, baseline 필드 갱신만 lock(executor·모니터 동시접근 보호).
         """
-        net = self._read_balance_net()   # 네트워크 + _positions 갱신
+        kind = self._balance_kind()
+        net = self._read_balance_net(kind)   # 네트워크 + _positions 갱신
         c01 = self._c01_net()
         now = self._clock()
         with self._lock:
@@ -125,8 +149,10 @@ class MarketDataStore:
             self._baseline = net
             self._baseline_net = c01
             self._baseline_at = now
+            self._anchor_kind = kind
         logger.info("포지션 앵커(%s): net=%d (C01 기준 %d, 앵커 직전 추정 %s)",
-                    "야간잔고" if self._session() == "night" else "t0441", net, c01, prev)
+                    "야간잔고" if kind == "night" else "t0441", net, c01, prev)
+        return net, prev
 
     def net_position(self) -> int:
         """순포지션 = 시작값(t0441) + C01 실시간 증감. 자동 재동기화는 하지 않는다.
@@ -134,13 +160,28 @@ class MarketDataStore:
         t0441 자동 재조회를 끈다 — 체결 직후 t0441은 그 체결을 아직 반영 못 해(지연) 낡은 값을
         주고, 그게 실시간 C01 포지션을 덮어써 오주문(오버슛)을 냈다. 그래서 최초 1회만 앵커하고
         이후엔 C01만으로 추적한다. t0441 재동기화는 사용자 [Idle조회] 버튼으로만(장이 잠잠할 때).
+
+        예외: **세션 전환(주간↔야간)** 뒤 첫 조회 때는 그 세션 잔고로 한 번 다시 앵커한다.
+        전환 시점은 session()이 정한다 — 앱은 장운영(JIF)으로 실제 장이 열렸을 때(단일가 호가접수
+        포함) 바꿔 주므로, 개시 직후라 진행 중 체결이 없어 낡은 조회 걱정이 없다.
+        직전 추정과 다르면 on_session_mismatch로 알린다(앱이 알람 + 주문 중지).
         """
         if self._feed is None:
             return self._read_balance_net()
+        kind = self._balance_kind()
         with self._lock:
             never = self._baseline is None
+            switched = not never and self._anchor_kind != kind
         if never:
             self._anchor_positions()
+        elif switched:
+            logger.info("세션 전환(%s) — 잔고 다시 조회", "주간→야간" if kind == "night" else "야간→주간")
+            net, prev = self._anchor_positions()
+            if prev is not None and prev != net and self.on_session_mismatch is not None:
+                try:
+                    self.on_session_mismatch(kind, prev, net)
+                except Exception:
+                    logger.exception("on_session_mismatch 예외")
         with self._lock:
             base = self._baseline or 0
             bnet = self._baseline_net

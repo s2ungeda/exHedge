@@ -25,9 +25,12 @@ from lsapi import LSClient
 from lsapi.config import get_settings
 from lsapi.futures import FuturesAPI, NightFuturesAPI, session_now
 from lsapi.logger import setup_logging
+from lsapi.paths import app_base_dir
+from lsapi.session_hours import load_special_hours, night_close_today, set_special_hours
 from lsapi.market_state import (
     JANGUBUN_DAY_FUTURES,
     JANGUBUN_NIGHT_FUTURES,
+    Phase,
     current_time_phase,
     is_tradeable,
     phase_badge,
@@ -109,6 +112,8 @@ class TradingApp:
     """화면 ↔ 시그널 ↔ 집행 배선."""
 
     def __init__(self):
+        # 특별일 거래시간(수능일 등) — 장운영(JIF) 미수신 시 시각 폴백이 이 시간표를 따른다.
+        set_special_hours(load_special_hours(app_base_dir() / "config" / "special_hours.txt"))
         _settings = get_settings()
         self._signal_token = _settings.signal_token   # 시그널 발신처 구분 토큰(SIGNAL_TOKEN)
         self.screen = OrderScreen(
@@ -162,7 +167,7 @@ class TradingApp:
         # 저장소는 세션별 REST 소스를 안다: 주간 t0441 / 야간 CCENQ90200(포지션 재동기화).
         self._store = MarketDataStore(
             self._store_api, code_prefix="A756",
-            night_api=self._night_api, session=lambda: session_now(_now_hhmm()),
+            night_api=self._night_api, session=self._balance_session,
         )
         # 모니터를 같은 프로세스의 Toplevel 창으로 — 중앙저장소를 참조만(별도 프로세스/구독 없음).
         try:
@@ -365,6 +370,7 @@ class TradingApp:
             token_manager=self._data_client.tokens,   # REST와 토큰 공유 → 재발급이 WS에도 반영
         )
         self._store.set_feed(self.rt)          # 포지션 C01 net·체결을 저장소에 연결
+        self._store.on_session_mismatch = self._on_session_mismatch   # 주간↔야간 잔고 불일치 → 주문 중지
         # 브로커는 저장소(포지션·미체결)에 위임 + 주문/호가(t2112)는 공용 api로.
         day = LSDayFuturesBroker(
             self._store, self._store_api, cfg.code,
@@ -556,7 +562,7 @@ class TradingApp:
         if sess == "closed":
             return True
         day = datetime.now().date()
-        if sess == "night" and hhmm < 600:
+        if sess == "night" and hhmm < night_close_today(day):   # 새벽 = 전날 시작한 야간장
             day -= timedelta(days=1)
         return not is_trading_day(day, self._holidays)
 
@@ -643,6 +649,19 @@ class TradingApp:
         self.screen.post(lambda: self.screen.trade_enabled.set(False))
         self._raise_alarm("breaker", "체결량 한도 초과 — 주문 자동 중지('주문' 다시 체크 필요)")
 
+    def _on_session_mismatch(self, kind: str, prev: int, net: int) -> None:
+        """세션 전환 잔고 재조회값이 이어 온 포지션과 다름(집행 스레드) → '주문' 해제 + 알람.
+
+        체결 통보 누락이나 세션별 잔고 기준 차이일 수 있다. 새 잔고를 쓰되 사용자가 확인하고
+        '주문'을 다시 체크해야 재개(latch).
+        """
+        name = "야간잔고" if kind == "night" else "주간잔고(t0441)"
+        self._trade_enabled = False
+        self.screen.post(lambda: self.screen.trade_enabled.set(False))
+        self._raise_alarm("session_pos",
+                          f"세션 전환 잔고 불일치 — 이어온 {prev} / {name} {net}. "
+                          f"주문 자동 중지('주문' 다시 체크 필요)")
+
     # ---- 주문 안전 체크박스 ----
     def _on_trade_toggle(self, enabled: bool) -> None:
         """'주문' 체크 → 실주문 허용. 해제 → 관찰모드(주문 안 나감). 즉시 반영."""
@@ -683,6 +702,29 @@ class TradingApp:
         flip = self._signal_token == "Meme"
         _, _, t = target_contracts(held, sig.total_coin, b, sig.fx, flip_hedge=flip)
         return t
+
+    def _balance_session(self) -> str:
+        """잔고를 어느 장 기준으로 읽나 — 'night'/'day'/'closed'(장 사이: 직전 기준 유지).
+
+        시계가 아니라 **장운영(JIF)**으로 판단한다. 수능일처럼 개시 시각이 바뀌는 날, 시계로
+        18:00에 야간잔고를 부르면 야간장이 아직 안 열린 상태라 엉뚱한 값을 받을 수 있다.
+        - 야간(8)이 단일가/접속/정지 중 → 'night' (실제로 열림)
+        - 주간(5)이 단일가/접속/정지 중 → 'day'
+        - JIF는 받았는데 둘 다 마감 → 'closed' (전환 안 함)
+        - JIF를 아직 못 받음(시동 직후·끊김) → 시계(session_now)로 폴백
+        """
+        rt = self.rt
+        if rt is not None:
+            open_phases = (Phase.AUCTION, Phase.CONTINUOUS, Phase.HALT)
+            seen_any = False
+            for jangubun, name in ((JANGUBUN_NIGHT_FUTURES, "night"), (JANGUBUN_DAY_FUTURES, "day")):
+                if rt.seen(jangubun):
+                    seen_any = True
+                    if rt.phase(jangubun) in open_phases:
+                        return name
+            if seen_any:
+                return "closed"
+        return session_now(_now_hhmm())
 
     def _in_session_window(self, cfg: OrderConfig) -> bool:
         # 1차 게이트: 현재시각(session_now) 세션 + 사용자가 정한 주문가능시간.
